@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  secret-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No seal tokens or keys in tracked files
+        run: python3 tools/secret_guard.py --all
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Unit tests and debug build
+        working-directory: android
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+
+  receiver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Byte-compile Python tools
+        run: python3 -m py_compile receiver/rtb_receiver.py tools/parse_bee_token.py tools/secret_guard.py

@@ -1,0 +1,36 @@
+# ---- Private: never published ------------------------------------------------
+# Local reverse-engineering rig. Contains a real device's seal token.
+/beelocal/
+# Personal notepad
+NOTES.md
+# Seal tokens and the captures they come from
+*.token
+*.token.*
+*btsnoop*
+bugreport*.zip
+# Signing keys (the debug keystore stays local too: in a public repo, a committed
+# key would let anyone build an "update" that inherits your installed app's data)
+*.keystore
+*.jks
+# Audio
+/recordings/
+receiver/recordings/
+*.aac
+*.wav
+
+# ---- Android / Gradle --------------------------------------------------------
+.gradle/
+.kotlin/
+build/
+local.properties
+*.apk
+*.aab
+.idea/
+*.iml
+captures/
+.cxx/
+
+# ---- Python ------------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/

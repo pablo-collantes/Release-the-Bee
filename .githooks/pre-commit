@@ -1,0 +1,3 @@
+#!/bin/sh
+# Refuse commits that contain an RTB seal token or a denylisted device value.
+exec python3 "$(git rev-parse --show-toplevel)/tools/secret_guard.py" --staged
