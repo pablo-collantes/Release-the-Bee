@@ -13,6 +13,7 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import kotlin.math.min
@@ -40,6 +41,7 @@ class RtbLink(
     private val ctx: Context,
     private val token: SealToken,
     knownAddress: String?,
+    private val knownAddressType: Int,
     private val listener: Listener,
 ) {
     enum class State { STOPPED, SCANNING, CONNECTING, HANDSHAKE, SEALING, STREAMING, PAUSED, WAITING, FAILED }
@@ -47,8 +49,11 @@ class RtbLink(
     interface Listener {
         fun onState(state: State, detail: String)
         fun onLog(line: String)
-        /** A scanned device proved to be the token's RTB: remember it for next time. */
-        fun onAddressConfirmed(address: String)
+        /**
+         * A scanned device proved to be the token's RTB: remember it for next time.
+         * [addressType] is BluetoothDevice.ADDRESS_TYPE_PUBLIC/RANDOM, or -1 if unknown.
+         */
+        fun onAddressConfirmed(address: String, addressType: Int)
         fun onStreamStart(deviceIdHex: String)
         fun onAudio(seq: Long, adts: ByteArray)
         fun onStreamEnd(reason: String)
@@ -61,6 +66,7 @@ class RtbLink(
     private val adapter = ctx.getSystemService(BluetoothManager::class.java).adapter
 
     private var address = knownAddress
+    private var device: BluetoothDevice? = null     // the confirmed RTB, as the stack knows it
     private var running = false
     private var paused = false
     private var gatt: BluetoothGatt? = null
@@ -149,11 +155,12 @@ class RtbLink(
             setState(State.WAITING, "Bluetooth is off")
             return
         }
-        val addr = address
-        if (addr == null) scan() else connect(addr, verify = false)
+        val dev = device ?: address?.let { remoteDevice(it, knownAddressType) }
+        if (dev == null) scan() else connect(dev, verify = false)
     }
 
-    private fun connect(addr: String, verify: Boolean) {
+    private fun connect(dev: BluetoothDevice, verify: Boolean) {
+        val addr = dev.address
         verifying = verify
         // First dial is direct (fast, times out). After a failure, dial with autoConnect:
         // the stack then waits, at low duty cycle, for the RTB to show up again.
@@ -162,19 +169,24 @@ class RtbLink(
             State.CONNECTING,
             if (auto) "waiting for RTB $addr to come back in range" else "connecting to $addr",
         )
-        gatt = remoteDevice(addr).connectGatt(
+        gatt = dev.connectGatt(
             ctx, auto, callback, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, h,
         )
         if (!auto) h.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
     }
 
-    private fun remoteDevice(addr: String): BluetoothDevice {
-        val first = addr.substring(0, 2).toInt(16)
-        // Top two bits 11 = static random address. Naming the type lets the stack connect
-        // after a reboot, when it no longer remembers the device from a scan.
-        return if (first and 0xC0 == 0xC0) adapter.getRemoteLeDevice(addr, BluetoothDevice.ADDRESS_TYPE_RANDOM)
-        else adapter.getRemoteDevice(addr)
-    }
+    /**
+     * A device for a stored address. With the address type a scan saw (Android 15+), the
+     * stack can dial it even after a reboot has emptied its cache. Without it, the stack
+     * uses what it remembers. Don't guess the type from the address bits: some RTBs use
+     * public addresses that look random.
+     */
+    private fun remoteDevice(addr: String, type: Int): BluetoothDevice =
+        if (type == BluetoothDevice.ADDRESS_TYPE_PUBLIC || type == BluetoothDevice.ADDRESS_TYPE_RANDOM) {
+            adapter.getRemoteLeDevice(addr, type)
+        } else {
+            adapter.getRemoteDevice(addr)
+        }
 
     private fun scan() {
         val scanner = adapter.bluetoothLeScanner ?: return retryLater("Bluetooth scanner unavailable")
@@ -202,7 +214,7 @@ class RtbLink(
         stopScan()
         log("found ${name ?: "an RTB"} at $addr (rssi ${r.rssi}); checking it's yours")
         attempts = 0
-        connect(addr, verify = true)
+        connect(r.device, verify = true)    // the scan's device object carries the right address type
     }
 
     private fun stopScan() {
@@ -453,10 +465,12 @@ class RtbLink(
 
     private fun confirmAddress() {
         val g = gatt ?: return
+        device = g.device
         if (!verifying && address != null) return
         verifying = false
         address = g.device.address
-        listener.onAddressConfirmed(g.device.address)
+        val type = if (Build.VERSION.SDK_INT >= 35) g.device.addressType else -1
+        listener.onAddressConfirmed(g.device.address, type)
     }
 
     private fun wrongDevice(ids: SecureIds) {

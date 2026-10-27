@@ -129,7 +129,7 @@ class MainActivity : Activity() {
         val previous = secrets.sealToken
         secrets.sealToken = t
         tokenInput.setText("")
-        if (previous != null && previous.deviceIdHex != t.deviceIdHex) settings.deviceAddress = null
+        if (previous != null && previous.deviceIdHex != t.deviceIdHex) forgetAddress()
         AppStatus.log("seal token saved for RTB ${t.deviceIdHex}")
         renderSetup()
         reloadIfRunning()
@@ -169,8 +169,13 @@ class MainActivity : Activity() {
         renderSetup()
     }
 
-    private fun forgetDevice() {
+    private fun forgetAddress() {
         settings.deviceAddress = null
+        settings.deviceAddressType = -1
+    }
+
+    private fun forgetDevice() {
+        forgetAddress()
         AppStatus.log("forgot the RTB's address; next start will scan for it")
         renderSetup()
         reloadIfRunning()

@@ -132,7 +132,7 @@ class RtbService : Service(), RtbLink.Listener {
         sinks = buildSinks(token!!.deviceIdHex)
         sinks.forEach { it.open() }
         AppStatus.update { it.copy(serviceRunning = true) }
-        link = RtbLink(this, token, settings.deviceAddress, this).also {
+        link = RtbLink(this, token, settings.deviceAddress, settings.deviceAddressType, this).also {
             it.setPaused(settings.paused)
             it.start()
         }
@@ -202,8 +202,9 @@ class RtbService : Service(), RtbLink.Listener {
 
     override fun onLog(line: String) = AppStatus.log(line)
 
-    override fun onAddressConfirmed(address: String) {
+    override fun onAddressConfirmed(address: String, addressType: Int) {
         settings.deviceAddress = address
+        settings.deviceAddressType = addressType
         AppStatus.log("remembered RTB at $address")
     }
 

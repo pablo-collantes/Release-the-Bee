@@ -14,6 +14,11 @@ class Settings(ctx: Context) {
         get() = p.getString("device_address", null)
         set(v) = p.edit().putString("device_address", v).apply()
 
+    /** Its BluetoothDevice.ADDRESS_TYPE_*, or -1 if unknown (Android 13–14). */
+    var deviceAddressType: Int
+        get() = p.getInt("device_address_type", -1)
+        set(v) = p.edit().putInt("device_address_type", v).apply()
+
     var sinkKind: SinkKind
         get() = runCatching { SinkKind.valueOf(p.getString("sink_kind", null)!!) }.getOrDefault(SinkKind.WEBSOCKET)
         set(v) = p.edit().putString("sink_kind", v.name).apply()
