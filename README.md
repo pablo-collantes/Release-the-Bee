@@ -45,7 +45,7 @@ We call the device the **RTB** (as in *Release the Bee*).
 4. **In the app:**
    1. Under *Setup*, tap **Allow** and **Unrestrict**.
    2. Import the seal token.
-   3. Under *Send audio to*, enter `ws://<your-machine>:8765/` and the token, then tap
+   3. Under *Send audio to*, enter `ws://<your-machine>:8740/` and the token, then tap
       **Save destination**.
    4. Tap **Start**. The first start scans for your RTB. After that the app reconnects on
       its own, including after a reboot.

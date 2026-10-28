@@ -32,7 +32,7 @@ class Settings(ctx: Context) {
         set(v) = p.edit().putString("tcp_host", v.trim()).apply()
 
     var tcpPort: Int
-        get() = p.getInt("tcp_port", 8766)
+        get() = p.getInt("tcp_port", 8741)
         set(v) = p.edit().putInt("tcp_port", v).apply()
 
     var recordOnPhone: Boolean

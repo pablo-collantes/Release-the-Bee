@@ -76,7 +76,7 @@ The "Raw TCP" destination sends only the concatenated ADTS bytes: no headers, no
 sessions, no auth. Anything that writes a socket to a file is a receiver:
 
 ```sh
-nc -l 8766 > rtb.aac
+nc -l 8741 > rtb.aac
 ```
 
 Use it on a private network only.

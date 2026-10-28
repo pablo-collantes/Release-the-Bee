@@ -375,7 +375,7 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, _ -> showDestinationFields() }
         }
         root.addView(sinkGroup)
-        wsUrl = field("ws://100.101.102.103:8765/").apply { inputType = InputType.TYPE_TEXT_VARIATION_URI }
+        wsUrl = field("ws://100.101.102.103:8740/").apply { inputType = InputType.TYPE_TEXT_VARIATION_URI }
         wsToken = field("Bearer token (optional)").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }

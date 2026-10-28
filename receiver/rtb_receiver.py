@@ -10,10 +10,10 @@ optionally, the raw-TCP stream. Each session is written to
 Concatenated ADTS frames are a valid .aac file: play it, or hand it to your
 transcriber with --on-session-end. Standard library only, Python 3.9+.
 
-  python3 receiver/rtb_receiver.py                          # WebSocket on 0.0.0.0:8765
-  python3 receiver/rtb_receiver.py --ws 100.101.102.103:8765 # bind to one interface (e.g. your VPN IP)
+  python3 receiver/rtb_receiver.py                          # WebSocket on 0.0.0.0:8740
+  python3 receiver/rtb_receiver.py --ws 100.101.102.103:8740 # bind to one interface (e.g. your VPN IP)
   python3 receiver/rtb_receiver.py --token SECRET           # require "Authorization: Bearer SECRET"
-  python3 receiver/rtb_receiver.py --tcp 0.0.0.0:8766       # also accept the raw-TCP sink
+  python3 receiver/rtb_receiver.py --tcp 0.0.0.0:8741       # also accept the raw-TCP sink
   python3 receiver/rtb_receiver.py --on-session-end 'my-transcribe {path}'
 """
 import argparse
@@ -314,7 +314,7 @@ async def serve(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ws", default="0.0.0.0:8765", help="host:port for the WebSocket listener ('' disables it)")
+    ap.add_argument("--ws", default="0.0.0.0:8740", help="host:port for the WebSocket listener ('' disables it)")
     ap.add_argument("--tcp", default="", help="host:port for a raw-TCP listener (off by default)")
     ap.add_argument("--out", default="recordings", help="directory for recordings (default ./recordings)")
     ap.add_argument("--token", default=os.environ.get("RTB_TOKEN"),
