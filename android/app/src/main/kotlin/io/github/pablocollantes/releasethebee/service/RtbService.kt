@@ -249,6 +249,7 @@ class RtbService : Service(), RtbLink.Listener {
         val title = when (st.link) {
             RtbLink.State.STREAMING -> "Streaming from your RTB"
             RtbLink.State.PAUSED -> "Paused: RTB connected, not recording"
+            RtbLink.State.MUTED -> "RTB muted itself: waiting for it to record again"
             RtbLink.State.FAILED -> "Needs attention"
             else -> "Keeping your RTB connected"
         }

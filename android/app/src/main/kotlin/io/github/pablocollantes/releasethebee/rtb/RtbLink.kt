@@ -44,7 +44,7 @@ class RtbLink(
     private val knownAddressType: Int,
     private val listener: Listener,
 ) {
-    enum class State { STOPPED, SCANNING, CONNECTING, HANDSHAKE, SEALING, STREAMING, PAUSED, WAITING, FAILED }
+    enum class State { STOPPED, SCANNING, CONNECTING, HANDSHAKE, SEALING, STREAMING, PAUSED, MUTED, WAITING, FAILED }
 
     interface Listener {
         fun onState(state: State, detail: String)
@@ -78,7 +78,8 @@ class RtbLink(
     private var step: Step? = null
     private var decryptor: AudioDecryptor? = null
     private var streaming = false
-    private var undecodable = 0
+    private var undecodable = 0                      // consecutive notifications with no AAC in them
+    private var lastNonceRefresh = 0L
 
     // Android runs one GATT operation at a time; queue them.
     private val ops = ArrayDeque<() -> Unit>()
@@ -399,7 +400,7 @@ class RtbLink(
                 send(Step.IDS_AFTER_SEAL, RtbProtocol.getSecureIds())
             }
             is Reply.Failed -> onFailed(r)
-            is Reply.Event -> log("RTB event 0x%04x %s".format(r.tag, r.payload.toHex()))
+            is Reply.Event -> onEvent(r)
             is Reply.Unknown -> log("unrecognised control message ${r.raw.toHex()}")
         }
     }
@@ -441,6 +442,27 @@ class RtbLink(
                 else -> {}
             }
             else -> log("RTB ok 0x%04x".format(r.op))
+        }
+    }
+
+    /**
+     * The RTB can stop and start recording on its own (its button, or its own logic) and
+     * says so with a device-state event: `[state][…]`, 0 = muted, 1 = recording.
+     * Muting ends our session; resuming starts a new one. The session nonce belongs to the
+     * connection: on hardware, audio after a self-mute and resume still decrypts with the
+     * nonce fetched at connect, so keep the decryptor. (If frames ever stop decrypting,
+     * [onAudio] refetches the nonce.)
+     */
+    private fun onEvent(e: Reply.Event) {
+        log("RTB event 0x%04x %s".format(e.tag, e.payload.toHex()))
+        if (e.tag != RtbProtocol.TAG_EVENT_DEVICE_STATE || e.payload.isEmpty()) return
+        if (gatt == null || step != null || paused) return     // our own handshake/pause caused it
+        val recording = e.payload[0].toInt() == RtbProtocol.STATE_RECORDING
+        if (!recording && streaming) {
+            endStream("RTB stopped recording")
+            setState(State.MUTED, "the RTB stopped recording (its button?); waiting for it to resume")
+        } else if (recording && !streaming) {
+            if (decryptor != null) beginStream() else send(Step.NONCE, RtbProtocol.getSessionNonce())
         }
     }
 
@@ -520,8 +542,17 @@ class RtbLink(
             if (step == Step.RECORD && !paused) beginStream() else return
         }
         val f = dec.decrypt(d) ?: return
-        if (!f.looksLikeAdts && undecodable++ % 50 == 0) {
-            log("frame ${f.seq} didn't decrypt to AAC (wrong key or stale nonce?)")
+        if (f.containsAdtsSync) {
+            undecodable = 0
+        } else if (++undecodable == STALE_NONCE_FRAMES && step == null) {
+            val now = System.currentTimeMillis()
+            if (now - lastNonceRefresh > 60_000) {
+                lastNonceRefresh = now
+                log("frames stopped decrypting to AAC; fetching a fresh nonce")
+                send(Step.NONCE, RtbProtocol.getSessionNonce())
+            } else {
+                log("frames still don't decrypt to AAC after a nonce refresh")
+            }
         }
         listener.onAudio(f.seq, f.adts)
     }
@@ -536,5 +567,6 @@ class RtbLink(
         private const val CONNECT_TIMEOUT_MS = 35_000L
         private const val SCAN_TIMEOUT_MS = 30_000L
         private const val REPLY_TIMEOUT_MS = 8_000L
+        private const val STALE_NONCE_FRAMES = 4
     }
 }

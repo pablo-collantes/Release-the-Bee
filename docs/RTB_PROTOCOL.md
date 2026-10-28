@@ -62,7 +62,7 @@ Notifications on the control characteristic start with a little-endian u16 tag:
 | `0x8004` | SetEncryptionKey: a key is already set | |
 | `0xA001` | Event: button double-press | |
 | `0xA002` | Event: button hold | |
-| `0xA003` | Event: device state changed | |
+| `0xA003` | Event: device state changed | `[state][…]`: `01 01` recording, `00 01` muted |
 | `0xA004` | Event: battery level | |
 | `0xA005` | Event: charging | |
 
@@ -106,13 +106,20 @@ connect → MTU 517 → discover services
 → enable notifications: control, then audio
 → GetSecureIds                     deviceId must match the token's, or this isn't your RTB
     not sealed → SetEncryptionKey(token) → GetSecureIds again (must now be sealed)
-→ GetSessionNonce                  new nonce every session: never reuse one across a reconnect
+→ GetSessionNonce                  fresh nonce on every connection: never reuse one across a reconnect
 → SetDeviceState(1)                audio notifications start
 ```
 
+The RTB can also mute and resume itself (its button, or its own logic) and reports it
+with event `0xA003`. Observed on hardware: after a 64-second self-mute, audio after the
+resume still decrypts with the nonce fetched at connect. **The nonce belongs to the
+connection**, not to each recording stretch. The last notification before a mute can
+end in a truncated AAC frame, which decoders skip.
+
 ## Audio
 
-Each audio notification is 495 bytes, about 8 per second:
+Each audio notification is 495 bytes. At the bitrate observed so far (about 8 kbps,
+with AAC frames of about 64 bytes) that is roughly 2 notifications per second:
 
 ```
 [seq u32 BE][491 bytes ciphertext]
@@ -124,6 +131,8 @@ Decrypt each frame on its own with AES-128-CTR:
 - IV = sessionNonce (12 bytes) ‖ seq (4 bytes, big-endian)
 - the counter restarts for every frame
 
-The plaintext is ADTS AAC-LC, 16 kHz, mono. ADTS frames can span notification
-boundaries, so treat the plaintexts as one continuous byte stream. Written back to
-back, they form a playable `.aac` file.
+The plaintext is ADTS AAC-LC, 16 kHz, mono. ADTS frames run across notification
+boundaries (only about 2% of notifications start on a frame header), so treat the
+plaintexts as one continuous byte stream. Written back to back, they form a playable
+`.aac` file. A quick check that the key and nonce are right: every notification
+contains at least one ADTS header (`FF F1`), and random bytes rarely do.

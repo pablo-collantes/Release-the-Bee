@@ -41,7 +41,7 @@ class AudioDecryptorTest {
             val f = dec.decrypt(frame(seq, encrypt(seq, adts)))!!
             assertEquals(seq, f.seq)
             assertArrayEquals(adts, f.adts)
-            assertTrue(f.looksLikeAdts)
+            assertTrue(f.containsAdtsSync)
         }
     }
 
@@ -49,6 +49,15 @@ class AudioDecryptorTest {
         val adts = byteArrayOf(0xFF.toByte(), 0xF1.toByte()) + ByteArray(100)
         val f = AudioDecryptor(key, ByteArray(12)).decrypt(frame(5, encrypt(5, adts)))!!
         assertFalse(f.adts.contentEquals(adts))
+        assertFalse(f.containsAdtsSync)
+    }
+
+    @Test fun `a notification that starts mid-frame still counts as AAC`() {
+        // Real RTB notifications: the tail of one ~64-byte ADTS frame, then the next header.
+        val pt = ByteArray(40) { 0x11 } + byteArrayOf(0xFF.toByte(), 0xF1.toByte(), 0x60, 0x40) + ByteArray(447) { 0x22 }
+        val f = AudioDecryptor(key, nonce).decrypt(frame(9, encrypt(9, pt)))!!
+        assertTrue(f.containsAdtsSync)
+        assertFalse(AudioDecryptor.Frame(0, ByteArray(491) { 0x22 }).containsAdtsSync)
     }
 
     @Test fun `ignores runt frames`() {

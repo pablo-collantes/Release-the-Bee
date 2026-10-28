@@ -72,7 +72,10 @@ class MainActivity : Activity() {
 
     private lateinit var logView: TextView
 
-    private val onStatus: () -> Unit = { renderStatus() }
+    private val onStatus: () -> Unit = {
+        renderStatus()
+        renderDevice()      // the address is learned while the screen is open
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -103,6 +106,7 @@ class MainActivity : Activity() {
             return
         }
         if (secrets.sealToken == null) return toast("Import your RTB's seal token first")
+        if (destinationEdited() && !saveDestination()) return   // typed a URL but didn't press Save
         settings.serviceEnabled = true
         settings.paused = false
         RtbService.send(this, RtbService.ACTION_START)
@@ -181,19 +185,32 @@ class MainActivity : Activity() {
         reloadIfRunning()
     }
 
-    private fun saveDestination() {
-        val kind = when (sinkGroup.checkedRadioButtonId) {
-            ID_TCP -> Settings.SinkKind.TCP
-            ID_NONE -> Settings.SinkKind.NONE
-            else -> Settings.SinkKind.WEBSOCKET
-        }
+    private fun checkedKind() = when (sinkGroup.checkedRadioButtonId) {
+        ID_TCP -> Settings.SinkKind.TCP
+        ID_NONE -> Settings.SinkKind.NONE
+        else -> Settings.SinkKind.WEBSOCKET
+    }
+
+    private fun destinationEdited(): Boolean =
+        checkedKind() != settings.sinkKind ||
+            wsUrl.text.toString().trim() != settings.wsUrl ||
+            wsToken.text.toString().trim() != (secrets.sinkToken ?: "") ||
+            tcpHost.text.toString().trim() != settings.tcpHost ||
+            tcpPort.text.toString().trim() != settings.tcpPort.toString() ||
+            recordBox.isChecked != settings.recordOnPhone
+
+    /** Validate and store the destination fields. False (with a toast) if they're invalid. */
+    private fun saveDestination(): Boolean {
+        val kind = checkedKind()
         val url = wsUrl.text.toString().trim()
         if (kind == Settings.SinkKind.WEBSOCKET && !url.startsWith("ws://") && !url.startsWith("wss://")) {
-            return toast("The URL must start with ws:// or wss://")
+            toast("The URL must start with ws:// or wss://")
+            return false
         }
         val port = tcpPort.text.toString().trim().toIntOrNull()
         if (kind == Settings.SinkKind.TCP && (tcpHost.text.isBlank() || port == null || port !in 1..65535)) {
-            return toast("Enter a host and a port (1-65535)")
+            toast("Enter a host and a port (1-65535)")
+            return false
         }
         settings.sinkKind = kind
         settings.wsUrl = url
@@ -204,6 +221,7 @@ class MainActivity : Activity() {
         AppStatus.log("destination saved: ${describeDestination()}")
         reloadIfRunning()
         toast("Saved")
+        return true
     }
 
     private fun describeDestination(): String = buildString {
@@ -224,6 +242,7 @@ class MainActivity : Activity() {
         stateView.text = when (st.link) {
             RtbLink.State.STREAMING -> "● Streaming"
             RtbLink.State.PAUSED -> "Paused"
+            RtbLink.State.MUTED -> "RTB muted"
             RtbLink.State.SCANNING -> "Looking for your RTB"
             RtbLink.State.CONNECTING -> "Connecting"
             RtbLink.State.HANDSHAKE -> "Setting up"
@@ -266,6 +285,10 @@ class MainActivity : Activity() {
         tokenInput.visibility = tokenImport.visibility
         forgetTokenBtn.visibility = if (token != null) View.VISIBLE else View.GONE
 
+        renderDevice()
+    }
+
+    private fun renderDevice() {
         val addr = settings.deviceAddress
         deviceView.text = addr?.let { "Paired RTB: $it" } ?: "No RTB yet. Start scans for the one your token belongs to."
         forgetDeviceBtn.visibility = if (addr != null) View.VISIBLE else View.GONE

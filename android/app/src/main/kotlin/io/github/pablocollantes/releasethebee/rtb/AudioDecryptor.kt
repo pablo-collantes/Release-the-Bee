@@ -33,8 +33,19 @@ class AudioDecryptor(ctrKey: ByteArray, nonce: ByteArray) {
     }
 
     class Frame(val seq: Long, val adts: ByteArray) {
-        /** ADTS sync word 0xFFF: a cheap check that the key and nonce are right. */
-        val looksLikeAdts: Boolean
-            get() = adts.size >= 2 && adts[0] == 0xFF.toByte() && (adts[1].toInt() and 0xF0) == 0xF0
+        /**
+         * Whether the plaintext contains an ADTS header (sync 0xFFF, layer 0). A cheap check
+         * that key and nonce are right. A notification doesn't have to *start* with one,
+         * because ADTS frames run across notification boundaries. But RTB frames are about
+         * 64 bytes, so a 491-byte notification always holds several. Random bytes (a stale
+         * nonce) rarely do.
+         */
+        val containsAdtsSync: Boolean
+            get() {
+                for (i in 0 until adts.size - 1) {
+                    if (adts[i] == 0xFF.toByte() && (adts[i + 1].toInt() and 0xF6) == 0xF0) return true
+                }
+                return false
+            }
     }
 }
