@@ -22,6 +22,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- A buzz when a command recording starts and ends -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
     <!-- usesCleartextTraffic: receivers are usually ws:// over a VPN or LAN that already
          encrypts the path. Use wss:// when the path is the open internet. -->
     <application

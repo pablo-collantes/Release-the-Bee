@@ -57,6 +57,13 @@ We call the device the **RTB** (as in *Release the Bee*).
    and a player that streams the audio from the receiver. The RTB's own button mutes and
    unmutes it.
 
+   **The RTB's button** (Settings): a single press records a summary, a double press records
+   a command (double press again to end it), and holding records a command while held. Each
+   gesture can be switched to summary, command or nothing. A command during a summary is kept
+   inside it. When a command starts and ends, the phone vibrates and, if you turn it on, the
+   RTB's light blinks. Settings also has buttons to test the light (blink, brightness, sleep
+   states) by hand.
+
 Recordings land in `recordings/<device>/<date>/<time>_<session>.aac`. With only the
 standard library, the receiver saves them and serves the audio. To get transcripts and
 summaries, set up processing.

@@ -24,19 +24,25 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import io.github.pablocollantes.releasethebee.rtb.RtbKey
 import io.github.pablocollantes.releasethebee.rtb.RtbLink
+import io.github.pablocollantes.releasethebee.rtb.RtbProtocol
 import io.github.pablocollantes.releasethebee.service.AppStatus
+import io.github.pablocollantes.releasethebee.service.Haptics
+import io.github.pablocollantes.releasethebee.service.Recorder
 import io.github.pablocollantes.releasethebee.service.RtbService
+import io.github.pablocollantes.releasethebee.sink.SessionInfo
 import io.github.pablocollantes.releasethebee.store.SecretStore
 import io.github.pablocollantes.releasethebee.store.Settings
 
 /**
  * The connection and everything behind it: the service (start, pause, stop), permissions
- * and battery, the RTB key, the paired RTB, where audio goes, and the log. The real work
- * happens in [RtbService]; this screen edits settings and sends it start/pause/stop/reload.
+ * and battery, the RTB key, the paired RTB, what its button does, command feedback, the
+ * light tests, where audio goes, and the log. The real work happens in [RtbService]; this
+ * screen edits settings and sends it start/pause/stop/reload and the tests.
  */
 class SettingsActivity : Activity() {
 
@@ -78,6 +84,13 @@ class SettingsActivity : Activity() {
     private lateinit var recordBox: CheckBox
 
     private lateinit var logView: TextView
+
+    private lateinit var lightNote: TextView
+    private lateinit var lightButtons: List<View>
+    private lateinit var replyView: TextView
+    private lateinit var brightnessBar: SeekBar
+    private lateinit var brightnessValue: TextView
+    private var brightnessShown: Int? = null
 
     private val onStatus: () -> Unit = {
         renderStatus()
@@ -340,7 +353,24 @@ class SettingsActivity : Activity() {
         pauseBtn.isEnabled = st.serviceRunning
         pauseBtn.text = if (settings.paused) "Resume" else "Pause"
         stopBtn.isEnabled = st.serviceRunning
+        renderLight(st)
         logView.text = AppStatus.logs().takeLast(80).joinToString("\n")
+    }
+
+    private fun renderLight(st: AppStatus.Snapshot) {
+        val ready = st.link == RtbLink.State.STREAMING || st.link == RtbLink.State.PAUSED || st.link == RtbLink.State.MUTED
+        lightButtons.forEach {
+            it.isEnabled = ready
+            it.alpha = if (ready) 1f else 0.5f
+        }
+        lightNote.text = if (ready) "Each button sends one request to the RTB. Its answer shows below and in the log."
+        else "Connect the RTB first (Start, at the top) to try these."
+        replyView.text = st.reply.ifBlank { "No answer yet" }
+        val b = st.brightness
+        if (b != null && b != brightnessShown) {
+            brightnessShown = b
+            brightnessBar.progress = b
+        }
     }
 
     private fun renderSetup() {
@@ -512,6 +542,10 @@ class SettingsActivity : Activity() {
             addView(forgetDeviceBtn)
         }, full())
 
+        buildButtonSection(root)
+        buildFeedbackSection(root)
+        buildLightSection(root)
+
         // Destination
         root.addView(ui.sectionHeader("Send audio to"))
         sinkGroup = RadioGroup(this).apply {
@@ -577,6 +611,164 @@ class SettingsActivity : Activity() {
         }
         return page
     }
+
+    /** What the RTB's button does. Changes apply from the next press. */
+    private fun buildButtonSection(root: LinearLayout) {
+        root.addView(ui.sectionHeader("The RTB's button"))
+        root.addView(label("Single press: the RTB mutes and unmutes itself. Unmuting records"))
+        root.addView(choice(
+            listOf("A summary" to SessionInfo.Kind.SUMMARY, "A command" to SessionInfo.Kind.COMMAND),
+            settings.unmuteKind,
+        ) { settings.unmuteKind = it })
+        root.addView(label("Double press"))
+        root.addView(choice(
+            listOf(
+                "Command: double press again to end it" to Recorder.Action.COMMAND,
+                "Summary: start or stop a recording" to Recorder.Action.SUMMARY,
+                "Nothing" to Recorder.Action.NOTHING,
+            ),
+            settings.doublePress,
+        ) { settings.doublePress = it })
+        root.addView(label("Press and hold"))
+        root.addView(choice(
+            listOf(
+                "Command while held" to Recorder.Action.COMMAND,
+                "Summary while held" to Recorder.Action.SUMMARY,
+                "Nothing" to Recorder.Action.NOTHING,
+            ),
+            settings.hold,
+        ) { settings.hold = it })
+        root.addView(label("Commands end on their own after"))
+        root.addView(choice(
+            listOf("15 s" to 15, "30 s" to 30, "1 min" to 60, "2 min" to 120),
+            settings.commandMaxSeconds,
+            horizontal = true,
+        ) { settings.commandMaxSeconds = it })
+        root.addView(note(
+            "A command during a summary recording is kept inside it, and the summary carries on after. " +
+                "From a muted RTB, a double press or hold unmutes it for the recording and mutes it after. " +
+                "A triple press counts as a double press. Five presses reset the RTB.",
+        ))
+    }
+
+    private fun buildFeedbackSection(root: LinearLayout) {
+        root.addView(ui.sectionHeader("When a command starts and ends"))
+        val haptics = Haptics(this)
+        val vibrate = check("Vibrate this phone: once at the start, twice at the end", settings.feedbackVibrate) {
+            settings.feedbackVibrate = it
+        }
+        val tryIt = ui.link("Try") {
+            haptics.commandStart()
+            vibrate.postDelayed({ haptics.commandEnd() }, 900)
+        }
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(vibrate, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(tryIt)
+        }, full())
+        root.addView(check("Blink the RTB's light: once at the start, twice at the end", settings.feedbackBlink) {
+            settings.feedbackBlink = it
+        }, full())
+        root.addView(note(
+            "Only for a command inside a summary recording: from a muted RTB, its light coming on and going " +
+                "off already shows it. A blink mutes the RTB for a moment, so that bit of audio is lost. " +
+                "Pick a blink length you can see below.",
+        ).apply { setPadding(ui.dp(32), 0, 0, 0) })
+    }
+
+    /** Requests to try by hand, again and again, to see what the RTB's light can do. */
+    private fun buildLightSection(root: LinearLayout) {
+        root.addView(ui.sectionHeader("The RTB's light (tests)"))
+        lightNote = note("")
+        root.addView(lightNote)
+
+        root.addView(label("Blink length (also used for command feedback)"))
+        root.addView(choice(
+            listOf("0.1 s" to 100, "0.3 s" to 300, "0.6 s" to 600, "1 s" to 1000),
+            settings.blinkMs,
+            horizontal = true,
+        ) { settings.blinkMs = it })
+        val blink1 = ui.button("Blink once") { test(RtbService.TEST_BLINK, 1) }
+        val blink2 = ui.button("Blink twice") { test(RtbService.TEST_BLINK, 2) }
+        root.addView(weighted(blink1, blink2), full(top = 4))
+
+        root.addView(label("Brightness (the stock app uses 35 to 100)"))
+        brightnessValue = ui.text(15f, bold = true).apply { minWidth = ui.dp(36) }
+        brightnessBar = SeekBar(this).apply {
+            max = 100
+            progress = AppStatus.snapshot.brightness ?: 65
+            progressTintList = ColorStateList.valueOf(ui.accent)
+            thumbTintList = ColorStateList.valueOf(ui.accent)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                    brightnessValue.text = value.toString()
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) {}
+                override fun onStopTrackingTouch(bar: SeekBar) {}
+            })
+        }
+        brightnessValue.text = brightnessBar.progress.toString()
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(brightnessBar, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(brightnessValue)
+        }, full())
+        val setB = ui.button("Set") { test(RtbService.TEST_BRIGHTNESS, brightnessBar.progress) }
+        val readB = ui.button("Read") { test(RtbService.TEST_READ_BRIGHTNESS) }
+        root.addView(weighted(setB, readB), full(top = 4))
+
+        root.addView(label("Recording state, like a single press"))
+        val record = ui.button("Record") { test(RtbService.TEST_RECORD, 1) }
+        val mute = ui.button("Mute") { test(RtbService.TEST_RECORD, 0) }
+        root.addView(weighted(record, mute), full(top = 4))
+
+        root.addView(label("Sleep states (untried: the RTB may stop answering until you press its button)"))
+        val sleepHw = ui.button("Sleep, hardware VAD") { test(RtbService.TEST_SLEEP, RtbProtocol.STATE_SLEEP_HW_VAD) }
+        val sleepSw = ui.button("Sleep, software VAD") { test(RtbService.TEST_SLEEP, RtbProtocol.STATE_SLEEP_SW_VAD) }
+        root.addView(weighted(sleepHw, sleepSw), full(top = 4))
+
+        replyView = ui.text(13f).apply { typeface = Typeface.MONOSPACE }
+        root.addView(ui.card().apply {
+            addView(ui.text(12f, ui.fgMuted, bold = true, value = "LAST ANSWER"))
+            addView(replyView)
+        }, full(top = 8))
+        lightButtons = listOf(blink1, blink2, brightnessBar, setB, readB, record, mute, sleepHw, sleepSw)
+    }
+
+    private fun test(what: String, value: Int = 0) {
+        if (!AppStatus.snapshot.serviceRunning) return toast("Start the connection first")
+        RtbService.test(this, what, value)
+    }
+
+    private fun label(value: String) = ui.text(15f, bold = true, value = value).apply { setPadding(0, ui.dp(12), 0, ui.dp(2)) }
+
+    private fun note(value: String) = ui.text(13f, ui.fgMuted, value = value).apply {
+        setLineSpacing(ui.dpf(1f), 1f)
+        setPadding(0, ui.dp(6), 0, 0)
+    }
+
+    private fun check(label: String, checked: Boolean, onChange: (Boolean) -> Unit) = CheckBox(this).apply {
+        text = label
+        textSize = 15f
+        isChecked = checked
+        buttonTintList = ColorStateList.valueOf(ui.accent)
+        setOnCheckedChangeListener { _, on -> onChange(on) }
+    }
+
+    /** Radio buttons for [options]; picking one calls [onPick] straight away. */
+    private fun <T> choice(options: List<Pair<String, T>>, current: T, horizontal: Boolean = false, onPick: (T) -> Unit) =
+        RadioGroup(this).apply {
+            orientation = if (horizontal) RadioGroup.HORIZONTAL else RadioGroup.VERTICAL
+            val ids = options.map { (text, value) ->
+                val b = radio(View.generateViewId(), text)
+                if (horizontal) addView(b, RadioGroup.LayoutParams(0, WRAP_CONTENT, 1f)) else addView(b)
+                b.id to value
+            }
+            ids.firstOrNull { it.second == current }?.let { check(it.first) }
+            setOnCheckedChangeListener { _, id -> ids.firstOrNull { it.first == id }?.let { onPick(it.second) } }
+        }
 
     private fun full(top: Int = 0) = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = ui.dp(top) }
 

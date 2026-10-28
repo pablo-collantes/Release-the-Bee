@@ -20,6 +20,12 @@ object AppStatus {
         val sinks: Map<String, String> = emptyMap(),
         val sessionStartedAt: Long? = null,
         val frames: Long = 0,
+        /** A command is recording (on its own, or inside a summary). */
+        val commandOpen: Boolean = false,
+        /** The RTB's LED brightness as last read, null until read this session. */
+        val brightness: Int? = null,
+        /** The RTB's answer to the last request from the light tests. */
+        val reply: String = "",
     )
 
     private const val TAG = "releasethebee"

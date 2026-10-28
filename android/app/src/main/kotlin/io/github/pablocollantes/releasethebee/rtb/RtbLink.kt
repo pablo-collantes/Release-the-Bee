@@ -38,6 +38,9 @@ import kotlin.math.min
  * Once streaming, a lost link is re-dialled with autoConnect, which
  * lets the Bluetooth stack wait for the RTB to come back in range instead of polling.
  *
+ * Whether the RTB should record survives reconnects: muted by its button (or by the
+ * app, [setRecording]) stays muted after the link comes back. Pause wins over both.
+ *
  * Everything runs on one private HandlerThread (GATT callbacks included), so there are
  * no locks. Listener callbacks arrive on that thread.
  */
@@ -48,6 +51,7 @@ class RtbLink(
     knownAddress: String?,
     private val knownAddressType: Int,
     private val listener: Listener,
+    recordOnConnect: Boolean = true,
 ) {
     enum class State { STOPPED, SCANNING, CONNECTING, HANDSHAKE, SEALING, STREAMING, PAUSED, MUTED, WAITING, FAILED }
 
@@ -64,7 +68,17 @@ class RtbLink(
         fun onStreamStart(deviceIdHex: String)
         fun onAudio(seq: Long, adts: ByteArray)
         fun onStreamEnd(reason: String)
+        /** A button gesture the RTB reports but doesn't act on. Not sent while paused. */
+        fun onButton(b: Button)
+        /** The RTB answered a request sent outside the handshake (the light tests, [setBrightness]…). */
+        fun onReply(line: String)
+        fun onBrightness(level: Int)
+        /** Whether the RTB should record changed (its button, or [setRecording]): keep it for the next start. */
+        fun onRecordingChoice(on: Boolean)
     }
+
+    /** A single press isn't here: the RTB mutes or unmutes itself, and the stream follows. */
+    enum class Button { DOUBLE_PRESS, HOLD_START, HOLD_END }
 
     private enum class Step { IDS, SEAL, IDS_AFTER_SEAL, NONCE, RECORD, MUTE }
 
@@ -76,6 +90,10 @@ class RtbLink(
     private var device: BluetoothDevice? = null     // the confirmed RTB, as the stack knows it
     private var running = false
     private var paused = false
+    private var wantRecording = recordOnConnect     // the RTB's last chosen state: its button, or ours
+    private var blinking = false                     // our own mute/unmute flicker: ignore its state events
+    private var blinkGen = 0
+    private var stateTests = 0                       // sleep requests awaiting their reply
     private var gatt: BluetoothGatt? = null
     private var control: BluetoothGattCharacteristic? = null
     private var scanCb: ScanCallback? = null
@@ -123,14 +141,61 @@ class RtbLink(
     fun setPaused(p: Boolean) = post {
         if (paused == p) return@post
         paused = p
+        if (p) decryptor = null                     // a fresh nonce on resume
         if (gatt == null || control == null || step != null) return@post   // applied by the handshake
-        if (p) {
-            endStream("paused")
-            decryptor = null
-            send(Step.MUTE, RtbProtocol.setDeviceState(RtbProtocol.STATE_MUTE))
-        } else {
-            send(Step.NONCE, RtbProtocol.getSessionNonce())
+        reconcile()
+    }
+
+    /**
+     * Record or mute, as the RTB's button would. Remembered across reconnects; ignored
+     * (until resumed) while paused. Mid-handshake, the handshake applies it at its end.
+     */
+    fun setRecording(on: Boolean) = post {
+        choose(on)
+        if (gatt == null || control == null || step != null) return@post
+        reconcile()
+    }
+
+    /**
+     * Flash the LED by flipping the RTB's state for [offMs], [times] times: off and back on
+     * while recording (that audio is lost), on and back off while muted. The recording
+     * carries on: the state events this causes are ignored.
+     */
+    fun blink(offMs: Long, times: Int) = post {
+        if (gatt == null || control == null || step != null || blinking) return@post reply("blink not sent: the RTB isn't connected or is busy")
+        val flip = if (streaming) RtbProtocol.STATE_MUTE else RtbProtocol.STATE_RECORDING
+        val back = if (streaming) RtbProtocol.STATE_RECORDING else RtbProtocol.STATE_MUTE
+        blinking = true
+        val gen = ++blinkGen
+        val at = { delay: Long, f: () -> Unit -> h.postDelayed({ if (gen == blinkGen && gatt != null) f() }, delay) }
+        var t = 0L
+        repeat(times.coerceIn(1, 5)) {
+            at(t) { writeControl(RtbProtocol.setDeviceState(flip)) }
+            at(t + offMs) { writeControl(RtbProtocol.setDeviceState(back)) }
+            t += offMs + BLINK_GAP_MS
         }
+        at(t + BLINK_SETTLE_MS) { blinking = false }
+        log("blink: ${if (streaming) "off" else "on"} for $offMs ms, ${times}×")
+    }
+
+    fun setBrightness(level: Int) = direct("brightness ${level.coerceIn(0, 100)}") {
+        writeControl(RtbProtocol.setBrightness(level))
+        writeControl(RtbProtocol.getBrightness())   // read back what the RTB kept
+    }
+
+    fun readBrightness() = direct("read brightness") { writeControl(RtbProtocol.getBrightness()) }
+
+    /**
+     * Put the RTB in a sleep state ([RtbProtocol.STATE_SLEEP_HW_VAD] or
+     * [RtbProtocol.STATE_SLEEP_SW_VAD]) to see what it does. [setRecording] or its button
+     * wakes it.
+     */
+    fun sleep(state: Int) = direct("device state $state") {
+        choose(false)
+        endStream("RTB put to sleep from the app")
+        stateTests++
+        writeControl(RtbProtocol.setDeviceState(state))
+        setState(State.MUTED, "RTB in sleep state $state (a test); Record or its button wakes it")
     }
 
     fun bluetoothChanged(on: Boolean) = post {
@@ -248,7 +313,7 @@ class RtbLink(
     private val replyTimeout = Runnable {
         if (step == Step.MUTE) {           // a missing mute ack isn't worth a reconnect
             step = null
-            setState(State.PAUSED, "paused")
+            settledMuted()
         } else {
             onLinkDown("RTB didn't answer (${step?.name})")
         }
@@ -275,6 +340,9 @@ class RtbLink(
 
     private fun teardown(reason: String) {
         endStream(reason)
+        blinkGen++
+        blinking = false
+        stateTests = 0
         h.removeCallbacks(replyTimeout)
         step = null
         decryptor = null
@@ -447,16 +515,27 @@ class RtbLink(
                 send(Step.RECORD, RtbProtocol.setDeviceState(RtbProtocol.STATE_RECORDING))
             }
             RtbProtocol.OP_SET_DEVICE_STATE -> when (step) {
-                Step.RECORD -> if (paused) muteNow() else beginStream()
+                Step.RECORD -> if (paused || !wantRecording) muteNow() else beginStream()
                 Step.MUTE -> {
                     step = null
                     h.removeCallbacks(replyTimeout)
                     attempts = 0
-                    setState(State.PAUSED, "paused; RTB connected and muted")
+                    if (wantRecording && !paused) record() else settledMuted()   // asked to record meanwhile
+                }
+                // Only a sleep test's reply: audio can start a recording before its own ack lands.
+                null -> if (stateTests > 0) {
+                    stateTests--
+                    reply("RTB state set: ${r.payload.toHex()}")
                 }
                 else -> {}
             }
-            else -> log("RTB ok 0x%04x %s".format(r.op, r.payload.toHex()))
+            RtbProtocol.OP_SET_BRIGHTNESS -> reply("RTB took the brightness")
+            RtbProtocol.OP_GET_BRIGHTNESS -> r.payload.firstOrNull()?.let {
+                val level = it.toInt() and 0xFF
+                listener.onBrightness(level)
+                reply("RTB brightness is $level")
+            }
+            else -> reply("RTB ok 0x%04x %s".format(r.op, r.payload.toHex()))
         }
     }
 
@@ -481,9 +560,14 @@ class RtbLink(
      */
     private fun onEvent(e: Reply.Event) {
         log("RTB event 0x%04x %s".format(e.tag, e.payload.toHex()))
+        when (e.tag) {
+            RtbProtocol.TAG_EVENT_DOUBLE_PRESS -> return button(Button.DOUBLE_PRESS)
+            RtbProtocol.TAG_EVENT_HOLD -> return button(if (e.payload.firstOrNull()?.toInt() == 1) Button.HOLD_START else Button.HOLD_END)
+        }
         if (e.tag != RtbProtocol.TAG_EVENT_DEVICE_STATE || e.payload.isEmpty()) return
-        if (gatt == null || step != null || paused) return     // our own handshake/pause caused it
+        if (gatt == null || step != null || paused || blinking) return     // our own handshake, pause or blink caused it
         val recording = e.payload[0].toInt() == RtbProtocol.STATE_RECORDING
+        choose(recording)                   // its button: keep that choice across reconnects
         if (!recording && streaming) {
             endStream("RTB stopped recording")
             setState(State.MUTED, "the RTB stopped recording (its button?); waiting for it to resume")
@@ -492,24 +576,58 @@ class RtbLink(
         }
     }
 
+    private fun button(b: Button) {
+        if (gatt == null || paused) return log("ignoring ${b.name.lowercase()}: ${if (paused) "paused" else "not connected"}")
+        listener.onButton(b)
+    }
+
     private fun onFailed(r: Reply.Failed) {
         val what = "${r.kind} for ${r.op?.let { "0x%04x".format(it) } ?: "?"}"
         when (step) {
             Step.SEAL -> fail("the RTB rejected the seal token ($what). Is the token from this RTB?")
-            Step.MUTE -> { step = null; setState(State.PAUSED, "paused") }
-            null -> log("RTB: $what")
+            Step.MUTE -> { step = null; settledMuted() }
+            null -> reply("RTB: $what")
             else -> onLinkDown("RTB answered $what during ${step?.name}")
         }
     }
 
     private fun afterSealed() {
-        if (paused) muteNow() else send(Step.NONCE, RtbProtocol.getSessionNonce())
+        if (paused || !wantRecording) muteNow() else send(Step.NONCE, RtbProtocol.getSessionNonce())
+    }
+
+    /** Bring the RTB in line with [wantRecording] and [paused]. Only between steps. */
+    private fun reconcile() {
+        val want = wantRecording && !paused
+        when {
+            want && !streaming -> record()
+            !want && streaming -> {
+                endStream(if (paused) "paused" else "muted from the app")
+                muteNow()
+            }
+            !want -> settledMuted()
+        }
+    }
+
+    /** The nonce belongs to the connection, so a mute and unmute keep it. */
+    private fun record() {
+        if (decryptor != null) send(Step.RECORD, RtbProtocol.setDeviceState(RtbProtocol.STATE_RECORDING))
+        else send(Step.NONCE, RtbProtocol.getSessionNonce())
     }
 
     private fun muteNow() {
-        decryptor = null
+        if (paused) decryptor = null
         send(Step.MUTE, RtbProtocol.setDeviceState(RtbProtocol.STATE_MUTE))
     }
+
+    private fun choose(on: Boolean) {
+        if (wantRecording == on) return
+        wantRecording = on
+        listener.onRecordingChoice(on)
+    }
+
+    private fun settledMuted() =
+        if (paused) setState(State.PAUSED, "paused; RTB connected and muted")
+        else setState(State.MUTED, "RTB muted; its button starts recording")
 
     private fun confirmAddress() {
         val g = gatt ?: return
@@ -573,7 +691,7 @@ class RtbLink(
         val dec = decryptor ?: return
         if (!streaming) {
             // Audio can beat the SetDeviceState ack; it confirms the same thing.
-            if (step == Step.RECORD && !paused) beginStream() else return
+            if (step == Step.RECORD && !paused && wantRecording) beginStream() else return
         }
         val f = dec.decrypt(d) ?: return
         if (f.containsAdtsSync) {
@@ -603,12 +721,22 @@ class RtbLink(
 
     private fun setState(s: State, detail: String) = listener.onState(s, detail)
     private fun log(line: String) = listener.onLog(line)
+    private fun reply(line: String) = listener.onReply(line)
     private fun post(f: () -> Unit) { h.post(f) }
+
+    /** A request from the app's tests: only on a ready link, never mid-handshake. */
+    private fun direct(what: String, f: () -> Unit) = post {
+        if (gatt == null || control == null || step != null) return@post reply("$what not sent: the RTB isn't connected or is busy")
+        log("→ $what")
+        f()
+    }
 
     companion object {
         private const val CONNECT_TIMEOUT_MS = 35_000L
         private const val SCAN_TIMEOUT_MS = 30_000L
         private const val REPLY_TIMEOUT_MS = 8_000L
         private const val STALE_NONCE_FRAMES = 4
+        private const val BLINK_GAP_MS = 400L       // between flashes of one blink
+        private const val BLINK_SETTLE_MS = 1_500L  // late state events from a blink are still ignored
     }
 }

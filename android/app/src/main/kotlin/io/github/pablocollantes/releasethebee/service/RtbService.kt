@@ -31,22 +31,24 @@ import io.github.pablocollantes.releasethebee.sink.WebSocketSink
 import io.github.pablocollantes.releasethebee.store.SecretStore
 import io.github.pablocollantes.releasethebee.store.Settings
 import io.github.pablocollantes.releasethebee.ui.MainActivity
-import java.util.UUID
 
 /**
  * Foreground service (type connectedDevice) that owns the RTB link and the audio sinks,
  * so streaming continues with the screen off and no UI open. START_STICKY plus
  * [BootReceiver] bring it back after the process is killed, a reboot, or an app update.
+ * [Recorder] decides what each stretch of audio is (summary or command) from the RTB's
+ * button; this service carries out what it asks for.
  */
 class RtbService : Service(), RtbLink.Listener {
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var settings: Settings
     private lateinit var wakeLock: PowerManager.WakeLock
+    private lateinit var haptics: Haptics
 
-    private var link: RtbLink? = null
-    private var sinks: List<AudioSink> = emptyList()
-    @Volatile private var session: SessionInfo? = null
+    @Volatile private var link: RtbLink? = null
+    @Volatile private var recorder: Recorder? = null
+    @Volatile private var sinks: List<AudioSink> = emptyList()
     @Volatile private var key: RtbKey? = null
     /** The RTB's deviceId, for the receiver's hello. Null until a ctrKey-only key has bound. */
     @Volatile private var deviceIdHex: String? = null
@@ -58,6 +60,7 @@ class RtbService : Service(), RtbLink.Listener {
     override fun onCreate() {
         super.onCreate()
         settings = Settings(this)
+        haptics = Haptics(this)
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReleaseTheBee:stream")
             .apply { setReferenceCounted(false) }
@@ -87,6 +90,24 @@ class RtbService : Service(), RtbLink.Listener {
             }
             ACTION_RELOAD -> if (link != null) {
                 shutdown { begin() }
+                return START_STICKY
+            }
+            ACTION_TEST -> {
+                val l = link
+                if (l == null) {
+                    AppStatus.log("test not sent: the RTB isn't connected")
+                    if (AppStatus.snapshot.serviceRunning) return START_STICKY
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                val v = intent.getIntExtra(EXTRA_VALUE, 0)
+                when (intent.getStringExtra(EXTRA_TEST)) {
+                    TEST_BRIGHTNESS -> l.setBrightness(v)
+                    TEST_READ_BRIGHTNESS -> l.readBrightness()
+                    TEST_BLINK -> l.blink(settings.blinkMs.toLong(), v)
+                    TEST_RECORD -> l.setRecording(v != 0)
+                    TEST_SLEEP -> l.sleep(v)
+                }
                 return START_STICKY
             }
             ACTION_DEBUG_SEND -> {
@@ -145,7 +166,11 @@ class RtbService : Service(), RtbLink.Listener {
         sinks = buildSinks()
         sinks.forEach { it.open() }
         AppStatus.update { it.copy(serviceRunning = true) }
-        link = RtbLink(this, k, settings.deviceAddress, settings.deviceAddressType, this).also {
+        recorder = Recorder({ settings.recorderConfig() }, recorderOut)
+        // Muted by its button stays muted, even across a restart. With unmuting set to record
+        // commands, the RTB rests muted until a press.
+        val recordOnConnect = settings.rtbRecording && settings.unmuteKind == SessionInfo.Kind.SUMMARY
+        link = RtbLink(this, k, settings.deviceAddress, settings.deviceAddressType, this, recordOnConnect).also {
             it.setPaused(settings.paused)
             it.start()
         }
@@ -236,16 +261,11 @@ class RtbService : Service(), RtbLink.Listener {
     }
 
     override fun onStreamStart(deviceIdHex: String) {
-        val s = SessionInfo(UUID.randomUUID().toString(), deviceIdHex, System.currentTimeMillis())
-        session = s
-        frames = 0
-        sinks.forEach { it.sessionStart(s) }
-        AppStatus.update { it.copy(sessionStartedAt = s.startedAtMs, frames = 0) }
+        recorder?.streamStarted(deviceIdHex)
     }
 
     override fun onAudio(seq: Long, adts: ByteArray) {
-        val f = AudioFrame(seq, System.currentTimeMillis(), adts)
-        sinks.forEach { it.audio(f) }
+        recorder?.audio(AudioFrame(seq, System.currentTimeMillis(), adts))
         if (++frames % 8 == 0L) {        // ~1/s
             AppStatus.update { it.copy(frames = frames) }
             if (frames % (8 * 60) == 0L) wakeLock.acquire(WAKELOCK_MS)   // extend while streaming
@@ -254,10 +274,67 @@ class RtbService : Service(), RtbLink.Listener {
     }
 
     override fun onStreamEnd(reason: String) {
-        val s = session ?: return
-        session = null
-        sinks.forEach { it.sessionEnd(s, reason) }
-        AppStatus.update { it.copy(sessionStartedAt = null) }
+        recorder?.streamEnded(reason)
+    }
+
+    override fun onButton(b: RtbLink.Button) {
+        recorder?.button(b)
+    }
+
+    override fun onReply(line: String) {
+        AppStatus.log(line)
+        AppStatus.update { it.copy(reply = line) }
+    }
+
+    override fun onBrightness(level: Int) = AppStatus.update { it.copy(brightness = level) }
+
+    override fun onRecordingChoice(on: Boolean) {
+        settings.rtbRecording = on
+    }
+
+    // ------------------------------------------------------------------ Recorder.Output
+
+    private val recorderOut = object : Recorder.Output {
+        override fun sessionStart(s: SessionInfo) {
+            sinks.forEach { it.sessionStart(s) }
+            val inside = s.parentId?.let { " inside ${it.take(8)}" } ?: ""
+            AppStatus.log("recording ${s.id.take(8)}: ${s.kind.wire}$inside, from ${s.trigger?.wire ?: "?"}")
+            if (s.parentId == null) {
+                frames = 0
+                AppStatus.update { it.copy(sessionStartedAt = s.startedAtMs, frames = 0, commandOpen = s.kind == SessionInfo.Kind.COMMAND) }
+            } else {
+                AppStatus.update { it.copy(commandOpen = true) }
+            }
+            refreshNotification(force = true)
+        }
+
+        override fun audio(f: AudioFrame) = sinks.forEach { it.audio(f) }
+
+        override fun sessionEnd(s: SessionInfo, reason: String) {
+            sinks.forEach { it.sessionEnd(s, reason) }
+            AppStatus.update {
+                if (s.parentId == null) it.copy(sessionStartedAt = null, commandOpen = false) else it.copy(commandOpen = false)
+            }
+            refreshNotification(force = true)
+        }
+
+        override fun setRecording(on: Boolean) {
+            link?.setRecording(on)
+        }
+
+        override fun commandFeedback(start: Boolean, ledShows: Boolean) {
+            if (settings.feedbackVibrate) if (start) haptics.commandStart() else haptics.commandEnd()
+            // The light already changes when the RTB unmutes or mutes for the command.
+            if (settings.feedbackBlink && !ledShows) link?.blink(settings.blinkMs.toLong(), if (start) 1 else 2)
+        }
+
+        override fun schedule(ms: Long, f: () -> Unit): () -> Unit {
+            val r = Runnable(f)
+            main.postDelayed(r, ms)
+            return { main.removeCallbacks(r) }
+        }
+
+        override fun log(line: String) = AppStatus.log(line)
     }
 
     // ------------------------------------------------------------------ notification
@@ -274,9 +351,9 @@ class RtbService : Service(), RtbLink.Listener {
     private fun buildNotification(): Notification {
         val st = AppStatus.snapshot
         val title = when (st.link) {
-            RtbLink.State.STREAMING -> "Streaming from your RTB"
+            RtbLink.State.STREAMING -> if (st.commandOpen) "Recording a command" else "Streaming from your RTB"
             RtbLink.State.PAUSED -> "Paused: RTB connected, not recording"
-            RtbLink.State.MUTED -> "RTB muted itself: waiting for it to record again"
+            RtbLink.State.MUTED -> "RTB muted: its button starts recording"
             RtbLink.State.FAILED -> "Needs attention"
             else -> "Keeping your RTB connected"
         }
@@ -323,6 +400,16 @@ class RtbService : Service(), RtbLink.Listener {
         const val ACTION_PAUSE = "io.github.pablocollantes.releasethebee.PAUSE"
         const val ACTION_RESUME = "io.github.pablocollantes.releasethebee.RESUME"
         const val ACTION_RELOAD = "io.github.pablocollantes.releasethebee.RELOAD"
+        /** Requests from the light tests in Settings: [EXTRA_TEST] is one of the TEST_ values. */
+        const val ACTION_TEST = "io.github.pablocollantes.releasethebee.TEST"
+        const val EXTRA_TEST = "test"
+        const val EXTRA_VALUE = "value"
+        const val TEST_BRIGHTNESS = "brightness"            // value: 0-100
+        const val TEST_READ_BRIGHTNESS = "read_brightness"
+        const val TEST_BLINK = "blink"                      // value: how many flashes
+        const val TEST_RECORD = "record"                    // value: 1 record, 0 mute
+        const val TEST_SLEEP = "sleep"                      // value: device state 2 or 4
+
         /** Debug builds only, from adb: see `src/debug/…/DebugReceiver.kt`. */
         const val ACTION_DEBUG_SEND = "io.github.pablocollantes.releasethebee.DEBUG_SEND"
         const val EXTRA_HEX = "hex"
@@ -340,6 +427,10 @@ class RtbService : Service(), RtbLink.Listener {
         /** Bluetooth is required; notifications are only nice to have. */
         fun hasPermissions(ctx: Context) = listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
             .all { ctx.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
+
+        fun test(ctx: Context, what: String, value: Int = 0) {
+            ctx.startService(Intent(ctx, RtbService::class.java).setAction(ACTION_TEST).putExtra(EXTRA_TEST, what).putExtra(EXTRA_VALUE, value))
+        }
 
         fun send(ctx: Context, action: String) {
             val i = Intent(ctx, RtbService::class.java).setAction(action)

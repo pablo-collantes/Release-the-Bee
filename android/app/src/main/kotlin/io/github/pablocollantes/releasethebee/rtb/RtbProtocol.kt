@@ -20,12 +20,19 @@ object RtbProtocol {
 
     const val OP_SET_DEVICE_STATE = 0xC006
     const val OP_GET_DEVICE_ID = 0xC00E
+    const val OP_SET_BRIGHTNESS = 0xC016
+    const val OP_GET_BRIGHTNESS = 0xC017
     const val OP_SET_ENCRYPTION_KEY = 0xC018
     const val OP_GET_SESSION_NONCE = 0xC019
     const val OP_GET_SECURE_IDS = 0xC01B
 
     const val STATE_MUTE = 0
     const val STATE_RECORDING = 1
+    const val STATE_SLEEP_HW_VAD = 2
+    const val STATE_SLEEP_SW_VAD = 4
+
+    /** The LED's only brightness channel. */
+    private const val LED_CHANNEL: Byte = 1
 
     const val TAG_OK = 0x8000
     const val TAG_ERROR = 0x8001
@@ -45,6 +52,8 @@ object RtbProtocol {
     fun getSessionNonce() = request(OP_GET_SESSION_NONCE)
     fun setEncryptionKey(token: SealToken) = request(OP_SET_ENCRYPTION_KEY, token.bytes())
     fun setDeviceState(state: Int) = request(OP_SET_DEVICE_STATE, byteArrayOf(state.toByte()))
+    fun setBrightness(level: Int) = request(OP_SET_BRIGHTNESS, byteArrayOf(LED_CHANNEL, level.coerceIn(0, 100).toByte()))
+    fun getBrightness() = request(OP_GET_BRIGHTNESS, byteArrayOf(LED_CHANNEL))
 
     fun parse(d: ByteArray): Reply {
         if (d.size < 2) return Reply.Unknown(d)

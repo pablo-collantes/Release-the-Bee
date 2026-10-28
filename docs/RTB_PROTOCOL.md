@@ -46,6 +46,26 @@ All opcodes are `0xC0nn`, so every request starts `nn C0`.
 | **GetSecureIds** | 0xC01B | `1B C0` | |
 | GetDSN | 0xC01D | `1D C0` | |
 
+### Undocumented opcodes
+
+Probed on hardware (firmware `13 06 00 01` from GetFirmwareVersion), each sent with no
+payload. **Don't send `0x10` or `0x11`**: both reset the RTB and clear its seal (the
+token reseals it).
+
+| Opcode | Reply | Effect |
+|---|---|---|
+| `0xC003`, `0xC007` | UnknownMessage | none |
+| `0xC00B` | OK `00` once, InvalidParam later | none seen |
+| `0xC00C`, `0xC00D` | OK, one byte (`00` before a reset, `03` after) | none seen; probably reads |
+| **`0xC010`** | none; the link drops | **resets the RTB, clears the seal** |
+| **`0xC011`** | none; the link drops | **resets the RTB, clears the seal** |
+| `0xC012`–`0xC01C` gaps | not probed | |
+
+Brightness takes a channel byte: only channel `01` exists (`17 C0 01` reads it, other
+channels give InvalidParam). SetBrightness accepts 0–100 and reads back what was set, but
+on this unit it doesn't visibly change the LED (solid green while recording), either
+steady or on a mute/unmute. The stock app clamps it to 35–100, default 65.
+
 SetDeviceState values: `0` mute, `1` recording, `2` sleep (hardware VAD), `3` power
 off, `4` sleep (software VAD). Start audio with `06 C0 01`, stop it with `06 C0 00`.
 
@@ -124,6 +144,11 @@ Observed on hardware (firmware as of 2026-10):
 
 Double press and hold don't change the recording state, so an app is free to give them
 any meaning. A hold reports its release, which makes push-to-talk possible.
+
+There is no command to light the LED by itself. An app can still flash it by flipping
+the recording state for a moment (`06 C0 00`, then `06 C0 01`): the audio in between is
+lost, and the state events this causes are the app's own. Release the Bee does this, when
+asked, for a command recorded inside a summary.
 
 The RTB can also mute and resume itself (its button, or its own logic) and reports it
 with event `0xA003`. Observed on hardware: after a 64-second self-mute, audio after the
