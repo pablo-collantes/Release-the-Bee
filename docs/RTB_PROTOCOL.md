@@ -60,8 +60,8 @@ Notifications on the control characteristic start with a little-endian u16 tag:
 | `0x8002` | InvalidParam | `[echoed opcode u16 LE]` |
 | `0x8003` | UnknownMessage | `[echoed opcode u16 LE]` |
 | `0x8004` | SetEncryptionKey: a key is already set | |
-| `0xA001` | Event: button double-press | |
-| `0xA002` | Event: button hold | |
+| `0xA001` | Event: button double-press | none. A triple press sends this too |
+| `0xA002` | Event: button hold | `01` when the hold starts, `00` on release |
 | `0xA003` | Event: device state changed | `[state][…]`: `01 01` recording, `00 01` muted |
 | `0xA004` | Event: battery level | |
 | `0xA005` | Event: charging | |
@@ -109,6 +109,21 @@ connect → MTU 517 → discover services
 → GetSessionNonce                  fresh nonce on every connection: never reuse one across a reconnect
 → SetDeviceState(1)                audio notifications start
 ```
+
+## The button
+
+Observed on hardware (firmware as of 2026-10):
+
+| Gesture | What the RTB does | Events |
+|---|---|---|
+| Single press | toggles mute itself | `0xA003` with the new state |
+| Double press | nothing on its own | `0xA001` |
+| Triple press | same as a double press | `0xA001` (the third press is swallowed) |
+| Hold | nothing on its own | `0xA002 01` when the hold registers, `0xA002 00` on release |
+| 5 quick presses | factory reset: clears the seal | — |
+
+Double press and hold don't change the recording state, so an app is free to give them
+any meaning. A hold reports its release, which makes push-to-talk possible.
 
 The RTB can also mute and resume itself (its button, or its own logic) and reports it
 with event `0xA003`. Observed on hardware: after a 64-second self-mute, audio after the

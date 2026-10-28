@@ -29,4 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Byte-compile Python tools
-        run: python3 -m py_compile receiver/rtb_receiver.py tools/parse_bee_token.py tools/secret_guard.py
+        run: python3 -m py_compile receiver/*.py tools/parse_bee_token.py tools/secret_guard.py
+      - name: Receiver tests (standard library only)
+        run: python3 -m unittest discover -s receiver/tests -v

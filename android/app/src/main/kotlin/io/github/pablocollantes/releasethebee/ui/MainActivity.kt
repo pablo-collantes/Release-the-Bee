@@ -2,496 +2,475 @@ package io.github.pablocollantes.releasethebee.ui
 
 import android.app.Activity
 import android.content.Intent
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
-import android.net.Uri
+import android.content.res.ColorStateList
 import android.os.Bundle
-import android.os.PowerManager
-import android.provider.Settings as AndroidSettings
-import android.text.InputType
+import android.os.Handler
+import android.os.Looper
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.Window
-import android.view.WindowInsets
-import android.view.inputmethod.EditorInfo
+import android.widget.BaseAdapter
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
-import android.widget.ScrollView
+import android.widget.ListView
+import android.widget.ProgressBar
 import android.widget.TextView
-import android.widget.Toast
+import io.github.pablocollantes.releasethebee.R
+import io.github.pablocollantes.releasethebee.api.Entry
+import io.github.pablocollantes.releasethebee.api.EntryPage
 import io.github.pablocollantes.releasethebee.rtb.RtbLink
-import io.github.pablocollantes.releasethebee.rtb.SealToken
 import io.github.pablocollantes.releasethebee.service.AppStatus
-import io.github.pablocollantes.releasethebee.service.RtbService
-import io.github.pablocollantes.releasethebee.store.SecretStore
+import io.github.pablocollantes.releasethebee.sink.EntryPush
 import io.github.pablocollantes.releasethebee.store.Settings
 
 /**
- * Status and setup. All the real work happens in [RtbService]; this screen only edits
- * settings and sends it start/pause/stop/reload.
+ * The recordings list. The RTB's own button mutes and unmutes, so this screen is about
+ * what was recorded: a status header (tap it for Settings) and the entries, newest first.
+ *
+ * It never polls. It fetches when it opens, after a push from the receiver, and when the
+ * receiver connection comes back (pushes may have been missed while it was down). After
+ * the first full fetch, every fetch is `?since=`, which returns only what changed.
  */
 class MainActivity : Activity() {
 
+    private lateinit var ui: Ui
+    private lateinit var fmt: Format
     private lateinit var settings: Settings
-    private lateinit var secrets: SecretStore
+    private val index get() = Receiver.index
+    private val main = Handler(Looper.getMainLooper())
 
-    private lateinit var stateView: TextView
-    private lateinit var detailView: TextView
-    private lateinit var sinkView: TextView
-    private lateinit var startBtn: Button
-    private lateinit var pauseBtn: Button
-    private lateinit var stopBtn: Button
+    private lateinit var rtbDot: View
+    private lateinit var rtbText: TextView
+    private lateinit var rtbSince: TextView
+    private lateinit var receiverDot: View
+    private lateinit var receiverText: TextView
+    private lateinit var statusDetail: TextView
 
-    private lateinit var permView: TextView
-    private lateinit var permBtn: Button
-    private lateinit var batteryView: TextView
-    private lateinit var batteryBtn: Button
+    private lateinit var banner: TextView
+    private lateinit var list: ListView
+    private val adapter = EntriesAdapter()
+    private lateinit var empty: LinearLayout
+    private lateinit var emptyTitle: TextView
+    private lateinit var emptyBody: TextView
+    private lateinit var emptyAction: Button
+    private lateinit var progress: ProgressBar
 
-    private lateinit var tokenView: TextView
-    private lateinit var tokenInput: EditText
-    private lateinit var tokenImport: LinearLayout
-    private lateinit var forgetTokenBtn: Button
+    private var source: Receiver.Source? = null
+    private var problem: Receiver.Problem? = null
+    private var fetchedOk = false
+    private var loading = false
+    private var again = false
+    private var lastNetwork: String? = null
 
-    private lateinit var deviceView: TextView
-    private lateinit var forgetDeviceBtn: Button
-
-    private lateinit var sinkGroup: RadioGroup
-    private lateinit var wsBox: LinearLayout
-    private lateinit var tcpBox: LinearLayout
-    private lateinit var wsUrl: EditText
-    private lateinit var wsToken: EditText
-    private lateinit var tcpHost: EditText
-    private lateinit var tcpPort: EditText
-    private lateinit var recordBox: CheckBox
-
-    private lateinit var logView: TextView
+    private val refreshSoon = Runnable { refresh() }
 
     private val onStatus: () -> Unit = {
         renderStatus()
-        renderDevice()      // the address is learned while the screen is open
+        // The receiver connection came back: catch up on pushes it may have missed.
+        val network = AppStatus.snapshot.sinks["network"]
+        if (network == "connected" && lastNetwork != null && lastNetwork != "connected") scheduleRefresh()
+        lastNetwork = network
+    }
+
+    private val onEntry: (EntryPush) -> Unit = { p ->
+        val known = index.applyPush(p)
+        if (known) adapter.update()
+        // A push carries status and title only. Fetch the rest (duration, preview) when the
+        // entry is new, or has just ended or finished.
+        val status = Entry.Status.of(p.status)
+        if (!known || status == Entry.Status.QUEUED || status.finished) scheduleRefresh()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestWindowFeature(Window.FEATURE_NO_TITLE)
+        ui = Ui(this)
+        fmt = Format(use24h = android.text.format.DateFormat.is24HourFormat(this))
         settings = Settings(this)
-        secrets = SecretStore(this)
         setContentView(buildUi())
-        loadDestination()
     }
 
-    override fun onResume() {
-        super.onResume()
+    override fun onStart() {
+        super.onStart()
         AppStatus.addListener(onStatus)
-        renderSetup()
+        AppStatus.addEntryListener(onEntry)
+        lastNetwork = AppStatus.snapshot.sinks["network"]
         renderStatus()
+        adapter.update()
+        render()
+        refresh()
     }
 
-    override fun onPause() {
+    override fun onStop() {
         AppStatus.removeListener(onStatus)
-        super.onPause()
+        AppStatus.removeEntryListener(onEntry)
+        main.removeCallbacks(refreshSoon)
+        super.onStop()
     }
 
-    // ------------------------------------------------------------------ actions
+    // ------------------------------------------------------------------ data
 
-    private fun start() {
-        if (!RtbService.hasPermissions(this)) {
-            requestPermissions(RtbService.PERMISSIONS, REQ_PERMS)
+    private fun scheduleRefresh() {
+        main.removeCallbacks(refreshSoon)
+        main.postDelayed(refreshSoon, 800)      // one fetch for a burst of pushes
+    }
+
+    private fun refresh() {
+        if (loading) {
+            again = true
             return
         }
-        if (secrets.sealToken == null) return toast("Import your RTB's seal token first")
-        if (destinationEdited() && !saveDestination()) return   // typed a URL but didn't press Save
-        settings.serviceEnabled = true
-        settings.paused = false
-        RtbService.send(this, RtbService.ACTION_START)
+        loading = true
+        render()
+        val app = applicationContext
+        val origin = Receiver.indexOrigin
+        val cursor = index.cursor
+        Ui.io.execute {
+            val src = Receiver.source(app)
+            val ready = src as? Receiver.Source.Ready
+            val since = if (ready != null && ready.api.origin == origin) cursor else null
+            val result = ready?.let { runCatching { it.api.entries(since) } }
+            runOnUiThread { onFetched(src, since, result) }
+        }
     }
 
-    private fun togglePause() {
-        val pause = !settings.paused
-        RtbService.send(this, if (pause) RtbService.ACTION_PAUSE else RtbService.ACTION_RESUME)
-        settings.paused = pause
+    private fun onFetched(src: Receiver.Source, since: Long?, result: Result<EntryPage>?) {
+        if (isDestroyed) return
+        loading = false
+        source = src
+        when {
+            result == null -> problem = Receiver.problem(src)
+            result.isSuccess -> {
+                val page = result.getOrThrow()
+                if (since == null) {
+                    index.replaceAll(page)
+                    Receiver.indexOrigin = (src as Receiver.Source.Ready).api.origin
+                } else {
+                    index.merge(page)
+                }
+                problem = null
+                fetchedOk = true
+            }
+            else -> {
+                problem = Receiver.problem(src, result.exceptionOrNull())
+                fetchedOk = false
+            }
+        }
+        adapter.update()
+        render()
         renderStatus()
-    }
-
-    private fun stop() {
-        settings.serviceEnabled = false
-        if (AppStatus.snapshot.serviceRunning) RtbService.send(this, RtbService.ACTION_STOP)
-    }
-
-    /** Apply changed settings to a running service. */
-    private fun reloadIfRunning() {
-        if (AppStatus.snapshot.serviceRunning) RtbService.send(this, RtbService.ACTION_RELOAD)
-    }
-
-    private fun saveToken(t: SealToken) {
-        val previous = secrets.sealToken
-        secrets.sealToken = t
-        tokenInput.setText("")
-        if (previous != null && previous.deviceIdHex != t.deviceIdHex) forgetAddress()
-        AppStatus.log("seal token saved for RTB ${t.deviceIdHex}")
-        renderSetup()
-        reloadIfRunning()
-    }
-
-    private fun importTokenText() {
-        val raw = tokenInput.text.toString()
-        if (raw.isBlank()) return toast("Paste the token first")
-        runCatching { SealToken.parse(raw) }
-            .onSuccess { saveToken(it) }
-            .onFailure { toast("Not a seal token: ${it.message}") }
-    }
-
-    private fun pickTokenFile() {
-        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
-        @Suppress("DEPRECATION")
-        startActivityForResult(i, REQ_TOKEN_FILE)
-    }
-
-    @Deprecated("Activity result API; fine for a framework-only Activity")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        @Suppress("DEPRECATION")
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQ_TOKEN_FILE || resultCode != RESULT_OK) return
-        val uri = data?.data ?: return
-        runCatching {
-            contentResolver.openInputStream(uri)!!.use { it.readNBytes(64 * 1024) }
-        }.mapCatching { SealToken.fromFile(it) }
-            .onSuccess { saveToken(it) }
-            .onFailure { toast("Couldn't read a seal token from that file: ${it.message}") }
-    }
-
-    private fun forgetToken() {
-        secrets.sealToken = null
-        stop()
-        AppStatus.log("seal token removed from this phone")
-        renderSetup()
-    }
-
-    private fun forgetAddress() {
-        settings.deviceAddress = null
-        settings.deviceAddressType = -1
-    }
-
-    private fun forgetDevice() {
-        forgetAddress()
-        AppStatus.log("forgot the RTB's address; next start will scan for it")
-        renderSetup()
-        reloadIfRunning()
-    }
-
-    private fun checkedKind() = when (sinkGroup.checkedRadioButtonId) {
-        ID_TCP -> Settings.SinkKind.TCP
-        ID_NONE -> Settings.SinkKind.NONE
-        else -> Settings.SinkKind.WEBSOCKET
-    }
-
-    private fun destinationEdited(): Boolean =
-        checkedKind() != settings.sinkKind ||
-            wsUrl.text.toString().trim() != settings.wsUrl ||
-            wsToken.text.toString().trim() != (secrets.sinkToken ?: "") ||
-            tcpHost.text.toString().trim() != settings.tcpHost ||
-            tcpPort.text.toString().trim() != settings.tcpPort.toString() ||
-            recordBox.isChecked != settings.recordOnPhone
-
-    /** Validate and store the destination fields. False (with a toast) if they're invalid. */
-    private fun saveDestination(): Boolean {
-        val kind = checkedKind()
-        val url = wsUrl.text.toString().trim()
-        if (kind == Settings.SinkKind.WEBSOCKET && !url.startsWith("ws://") && !url.startsWith("wss://")) {
-            toast("The URL must start with ws:// or wss://")
-            return false
+        if (again) {
+            again = false
+            refresh()
         }
-        val port = tcpPort.text.toString().trim().toIntOrNull()
-        if (kind == Settings.SinkKind.TCP && (tcpHost.text.isBlank() || port == null || port !in 1..65535)) {
-            toast("Enter a host and a port (1-65535)")
-            return false
-        }
-        settings.sinkKind = kind
-        settings.wsUrl = url
-        secrets.sinkToken = wsToken.text.toString()
-        settings.tcpHost = tcpHost.text.toString()
-        if (port != null) settings.tcpPort = port
-        settings.recordOnPhone = recordBox.isChecked
-        AppStatus.log("destination saved: ${describeDestination()}")
-        reloadIfRunning()
-        toast("Saved")
-        return true
-    }
-
-    private fun describeDestination(): String = buildString {
-        append(
-            when (settings.sinkKind) {
-                Settings.SinkKind.WEBSOCKET -> settings.wsUrl.ifBlank { "(no URL)" }
-                Settings.SinkKind.TCP -> "tcp://${settings.tcpHost}:${settings.tcpPort}"
-                Settings.SinkKind.NONE -> "nowhere"
-            },
-        )
-        if (settings.recordOnPhone) append(" + this phone")
     }
 
     // ------------------------------------------------------------------ render
 
+    /** The list, or what to show instead of it. */
+    private fun render() {
+        val src = source
+        val showList = src !is Receiver.Source.NotSet && src !is Receiver.Source.TcpOnly && adapter.count > 0
+        list.visibility = if (showList) View.VISIBLE else View.GONE
+        val p = problem
+        banner.visibility = if (showList && p != null) View.VISIBLE else View.GONE
+        if (showList && p != null) banner.text = "${p.title}. Showing the last list it sent."
+
+        progress.visibility = if (!showList && loading && p == null) View.VISIBLE else View.GONE
+        empty.visibility = if (!showList && progress.visibility != View.VISIBLE && src != null) View.VISIBLE else View.GONE
+        if (p != null) {
+            emptyTitle.text = p.title
+            emptyBody.text = p.body
+            emptyAction.visibility = View.VISIBLE
+            emptyAction.text = if (p.action == Receiver.Problem.Action.SETTINGS) "Open Settings" else "Try again"
+            emptyAction.setOnClickListener {
+                if (p.action == Receiver.Problem.Action.SETTINGS) openSettings() else refresh()
+            }
+        } else {
+            emptyTitle.text = "No recordings yet"
+            emptyBody.text = if (AppStatus.snapshot.serviceRunning) "Unmute your RTB to record."
+            else "Unmute your RTB to record. The connection is off: start it in Settings."
+            emptyAction.visibility = if (AppStatus.snapshot.serviceRunning) View.GONE else View.VISIBLE
+            emptyAction.text = "Open Settings"
+            emptyAction.setOnClickListener { openSettings() }
+        }
+    }
+
     private fun renderStatus() {
         val st = AppStatus.snapshot
-        stateView.text = when (st.link) {
-            RtbLink.State.STREAMING -> "● Streaming"
-            RtbLink.State.PAUSED -> "Paused"
-            RtbLink.State.MUTED -> "RTB muted"
-            RtbLink.State.SCANNING -> "Looking for your RTB"
-            RtbLink.State.CONNECTING -> "Connecting"
-            RtbLink.State.HANDSHAKE -> "Setting up"
-            RtbLink.State.SEALING -> "Sealing"
-            RtbLink.State.WAITING -> "Waiting"
-            RtbLink.State.FAILED -> "Needs attention"
-            RtbLink.State.STOPPED -> if (st.serviceRunning) "Starting" else "Stopped"
+        val (rtb, rtbColor) = when (st.link) {
+            RtbLink.State.STREAMING -> "RTB recording" to ui.red
+            RtbLink.State.MUTED -> "RTB muted" to ui.gray
+            RtbLink.State.PAUSED -> "RTB muted from Settings" to ui.gray
+            RtbLink.State.SCANNING, RtbLink.State.CONNECTING, RtbLink.State.HANDSHAKE,
+            RtbLink.State.SEALING, RtbLink.State.WAITING -> "Connecting to RTB" to ui.accent
+            RtbLink.State.FAILED -> "RTB needs attention" to ui.red
+            RtbLink.State.STOPPED -> if (st.serviceRunning) "Connecting to RTB" to ui.accent else "RTB off" to ui.gray
         }
-        detailView.text = buildString {
-            append(st.linkDetail.ifBlank { "Press Start to connect to your RTB." })
-            st.sessionStartedAt?.let {
-                val secs = (System.currentTimeMillis() - it) / 1000
-                append("\nSession %d:%02d · %,d frames".format(secs / 60, secs % 60, st.frames))
+        rtbText.text = rtb
+        tint(rtbDot, rtbColor)
+        val started = st.sessionStartedAt
+        rtbSince.text = if (st.link == RtbLink.State.STREAMING && started != null) "since ${fmt.clock(started)}" else ""
+
+        val (receiver, receiverColor) = receiverState(st)
+        receiverText.text = receiver
+        tint(receiverDot, receiverColor)
+
+        val detail = when (st.link) {
+            RtbLink.State.FAILED -> st.linkDetail
+            RtbLink.State.WAITING -> st.linkDetail.replaceFirstChar { it.uppercase() }
+            RtbLink.State.STOPPED -> if (st.serviceRunning) "" else "Turned off. Start it in Settings."
+            else -> ""
+        }
+        statusDetail.text = detail
+        statusDetail.setTextColor(if (st.link == RtbLink.State.FAILED) ui.red else ui.fgMuted)
+        statusDetail.visibility = if (detail.isBlank()) View.GONE else View.VISIBLE
+    }
+
+    private fun receiverState(st: AppStatus.Snapshot): Pair<String, Int> {
+        val wsSet = settings.sinkKind == Settings.SinkKind.WEBSOCKET && settings.wsUrl.isNotBlank()
+        val tcpSet = settings.sinkKind == Settings.SinkKind.TCP && settings.tcpHost.isNotBlank()
+        if (!wsSet && !tcpSet) return "No receiver set" to ui.gray
+        val network = st.sinks["network"]
+        if (st.serviceRunning && network != null) {
+            return when {
+                network == "connected" -> "Receiver connected" to ui.green
+                network == "connecting" -> "Connecting to the receiver" to ui.accent
+                network.startsWith("unreachable") -> "Receiver unreachable" to ui.red
+                else -> "Receiver $network" to ui.gray
             }
         }
-        sinkView.text = if (st.sinks.isEmpty()) "Destination: ${describeDestination()}"
-        else st.sinks.entries.joinToString("\n") { (k, v) -> "$k: $v" }
-        startBtn.isEnabled = !st.serviceRunning
-        pauseBtn.isEnabled = st.serviceRunning
-        pauseBtn.text = if (settings.paused) "Resume" else "Pause"
-        stopBtn.isEnabled = st.serviceRunning
-        logView.text = AppStatus.logs().takeLast(80).joinToString("\n")
+        // Not streaming: say what the last fetch found.
+        return when {
+            fetchedOk -> "Receiver reachable" to ui.green
+            problem != null && source is Receiver.Source.Ready -> "Receiver unreachable" to ui.red
+            else -> "Receiver" to ui.gray
+        }
     }
 
-    private fun renderSetup() {
-        val perms = RtbService.hasPermissions(this)
-        permView.text = if (perms) "Bluetooth: allowed ✓" else "Bluetooth: permission needed"
-        permBtn.visibility = if (perms) View.GONE else View.VISIBLE
+    private fun tint(dot: View, color: Int) = ui.setDot(dot, color)
 
-        val unrestricted = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
-        batteryView.text = if (unrestricted) "Battery: unrestricted ✓"
-        else "Battery: optimised. Android may cut the connection in the background."
-        batteryBtn.visibility = if (unrestricted) View.GONE else View.VISIBLE
-
-        val token = secrets.sealToken
-        tokenView.text = if (token != null) "Token for RTB ${token.deviceIdHex} ✓ (encrypted on this phone)"
-        else "No token yet. Paste the 108-byte token (216 hex characters) or import the file " +
-            "tools/parse_bee_token.py produced."
-        tokenImport.visibility = if (token == null) View.VISIBLE else View.GONE
-        tokenInput.visibility = tokenImport.visibility
-        forgetTokenBtn.visibility = if (token != null) View.VISIBLE else View.GONE
-
-        renderDevice()
-    }
-
-    private fun renderDevice() {
-        val addr = settings.deviceAddress
-        deviceView.text = addr?.let { "Paired RTB: $it" } ?: "No RTB yet. Start scans for the one your token belongs to."
-        forgetDeviceBtn.visibility = if (addr != null) View.VISIBLE else View.GONE
-    }
-
-    private fun loadDestination() {
-        sinkGroup.check(
-            when (settings.sinkKind) {
-                Settings.SinkKind.WEBSOCKET -> ID_WS
-                Settings.SinkKind.TCP -> ID_TCP
-                Settings.SinkKind.NONE -> ID_NONE
-            },
-        )
-        wsUrl.setText(settings.wsUrl)
-        wsToken.setText(secrets.sinkToken ?: "")
-        tcpHost.setText(settings.tcpHost)
-        tcpPort.setText(settings.tcpPort.toString())
-        recordBox.isChecked = settings.recordOnPhone
-        showDestinationFields()
-    }
-
-    private fun showDestinationFields() {
-        wsBox.visibility = if (sinkGroup.checkedRadioButtonId == ID_WS) View.VISIBLE else View.GONE
-        tcpBox.visibility = if (sinkGroup.checkedRadioButtonId == ID_TCP) View.VISIBLE else View.GONE
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        renderSetup()
-    }
+    private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
 
     // ------------------------------------------------------------------ layout
 
     private fun buildUi(): View {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        root.addView(text(24f, bold = true).apply { text = "Release the Bee" })
-        root.addView(text(14f).apply {
-            text = "Your RTB → this phone → your own machine."
-            alpha = 0.7f
+        val (bar, _) = ui.topBar(
+            "Recordings", null,
+            ui.icon(R.drawable.ic_refresh, "Refresh") { refresh() },
+            ui.icon(R.drawable.ic_settings, "Settings") { openSettings() },
+        )
+        root.addView(bar)
+
+        // Status header: tap for Settings.
+        rtbDot = ui.dot(ui.gray, 10)
+        rtbText = ui.text(16f, bold = true).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
+        rtbSince = ui.text(13f, ui.fgMuted)
+        receiverDot = ui.dot(ui.gray, 10)
+        receiverText = ui.text(14f, ui.fgMuted).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
+        statusDetail = ui.text(13f, ui.fgMuted).apply { visibility = View.GONE }
+        val lines = ui.column(
+            ui.row(rtbDot, rtbText.withStart(10, weight = 1f), rtbSince.withStart(8)),
+            ui.row(receiverDot, receiverText.withStart(10, weight = 1f)).apply { setPadding(0, ui.dp(6), 0, 0) },
+            statusDetail.apply { setPadding(ui.dp(20), ui.dp(6), 0, 0) },
+        )
+        val chevron = ImageView(this).apply {
+            setImageResource(R.drawable.ic_chevron_right)
+            imageTintList = ColorStateList.valueOf(ui.fgMuted)
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = ui.ripple(ui.rounded(ui.surface, 16))
+            setPadding(ui.dp(16), ui.dp(14), ui.dp(8), ui.dp(14))
+            isClickable = true
+            contentDescription = "Status. Opens Settings"
+            setOnClickListener { openSettings() }
+            addView(lines, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(chevron, LinearLayout.LayoutParams(ui.dp(24), ui.dp(24)).apply { marginStart = ui.dp(8) })
+        }
+        root.addView(header, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
+            setMargins(ui.dp(16), ui.dp(4), ui.dp(16), ui.dp(8))
         })
 
-        val card = LinearLayout(this).apply {
+        banner = ui.text(13f, ui.fg).apply {
+            background = ui.ripple(ui.rounded(ui.redSoft, 12))
+            setPadding(ui.dp(14), ui.dp(10), ui.dp(14), ui.dp(10))
+            visibility = View.GONE
+            setOnClickListener { refresh() }
+        }
+        root.addView(banner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
+            setMargins(ui.dp(16), 0, ui.dp(16), ui.dp(4))
+        })
+
+        list = ListView(this).apply {
+            adapter = this@MainActivity.adapter
+            divider = null
+            clipToPadding = false
+            setOnItemClickListener { _, _, pos, _ ->
+                (this@MainActivity.adapter.getItem(pos) as? Row.Item)?.let { EntryActivity.open(this@MainActivity, it.e.id) }
+            }
+        }
+        progress = ProgressBar(this).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(ui.accent)
+            visibility = View.GONE
+        }
+        empty = buildEmpty()
+        val body = FrameLayout(this).apply {
+            addView(list, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(progress, FrameLayout.LayoutParams(ui.dp(40), ui.dp(40), Gravity.CENTER))
+            addView(empty, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER))
+        }
+        root.addView(body, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+
+        val capped = CappedWidth(this, ui.dp(760)).apply { addView(root, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)) }
+        Ui.edgeToEdge(this, capped) { v, top, bottom, left, right ->
+            v.setPadding(left, top, right, 0)
+            list.setPadding(0, 0, 0, bottom + ui.dp(8))
+            empty.setPadding(ui.dp(32), 0, ui.dp(32), bottom)
+        }
+        return capped
+    }
+
+    private fun buildEmpty(): LinearLayout {
+        val badge = ImageView(this).apply {
+            setImageResource(R.drawable.ic_stat_rtb)
+            imageTintList = ColorStateList.valueOf(ui.onAccent)
+            background = ui.rounded(ui.accent, 36)
+            setPadding(ui.dp(18), ui.dp(18), ui.dp(18), ui.dp(18))
+        }
+        emptyTitle = ui.text(19f, bold = true).apply { gravity = Gravity.CENTER }
+        emptyBody = ui.text(15f, ui.fgMuted).apply {
+            gravity = Gravity.CENTER
+            setLineSpacing(ui.dpf(2f), 1f)
+        }
+        emptyAction = ui.primaryButton("Open Settings") { openSettings() }
+        return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = GradientDrawable().apply {
-                cornerRadius = dp(12).toFloat()
-                setColor(0x33F5C518)
-            }
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(badge, LinearLayout.LayoutParams(ui.dp(72), ui.dp(72)))
+            addView(emptyTitle, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = ui.dp(20) })
+            addView(emptyBody, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = ui.dp(8) })
+            addView(emptyAction, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = ui.dp(20) })
         }
-        stateView = text(20f, bold = true)
-        detailView = text(14f)
-        sinkView = text(13f).apply { alpha = 0.8f }
-        card.addView(stateView)
-        card.addView(detailView)
-        card.addView(sinkView)
-        root.addView(card, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(16) })
+    }
 
-        startBtn = button("Start") { start() }
-        pauseBtn = button("Pause") { togglePause() }
-        stopBtn = button("Stop") { stop() }
-        root.addView(row(startBtn, pauseBtn, stopBtn))
+    private fun View.withStart(marginDp: Int, weight: Float = 0f): View = apply {
+        layoutParams = LinearLayout.LayoutParams(if (weight > 0f) 0 else WRAP_CONTENT, WRAP_CONTENT, weight).apply {
+            marginStart = ui.dp(marginDp)
+        }
+    }
 
-        root.addView(header("Setup"))
-        permView = text(14f)
-        permBtn = button("Allow") { requestPermissions(RtbService.PERMISSIONS, REQ_PERMS) }
-        root.addView(labelled(permView, permBtn))
-        batteryView = text(14f)
-        batteryBtn = button("Unrestrict") {
-            startActivity(
-                Intent(AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")),
+    // ------------------------------------------------------------------ list
+
+    private sealed interface Row {
+        class Day(val label: String) : Row
+        class Item(val e: Entry) : Row
+    }
+
+    private inner class EntriesAdapter : BaseAdapter() {
+        private var rows: List<Row> = emptyList()
+
+        /** Rebuild from [index], with a header for each day. */
+        fun update() {
+            val out = ArrayList<Row>()
+            var day: java.time.LocalDate? = null
+            val now = System.currentTimeMillis()
+            for (e in index.entries) {
+                val d = fmt.localDate(e.startedAt)
+                if (d != day) {
+                    out += Row.Day(fmt.day(e.startedAt, now))
+                    day = d
+                }
+                out += Row.Item(e)
+            }
+            rows = out
+            notifyDataSetChanged()
+        }
+
+        override fun getCount() = rows.size
+        override fun getItem(position: Int): Any = rows[position]
+        override fun getItemId(position: Int) = position.toLong()
+        override fun getViewTypeCount() = 2
+        override fun getItemViewType(position: Int) = if (rows[position] is Row.Day) 0 else 1
+        override fun areAllItemsEnabled() = false
+        override fun isEnabled(position: Int) = rows[position] is Row.Item
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View =
+            when (val r = rows[position]) {
+                is Row.Day -> ((convertView as? TextView) ?: ui.text(13f, ui.fgMuted, bold = true).apply {
+                    setPadding(ui.dp(20), ui.dp(20), ui.dp(20), ui.dp(4))
+                }).apply { text = r.label }
+                is Row.Item -> {
+                    val holder = (convertView?.tag as? EntryRow) ?: EntryRow()
+                    holder.bind(r.e)
+                    holder.view
+                }
+            }
+    }
+
+    /** One recording in the list. */
+    private inner class EntryRow {
+        val title = ui.text(16f, bold = true).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
+        val duration = ui.text(13f, ui.fgMuted)
+        val time = ui.text(13f, ui.fgMuted)
+        val kind = ui.badge("Summary", ui.surface, ui.fgMuted)
+        val statusDot = ui.dot(ui.gray, 6)
+        val status = ui.text(13f, ui.fgMuted)
+        val preview = ui.text(14f, ui.fgMuted).apply {
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            setLineSpacing(ui.dpf(1f), 1f)
+        }
+        val view: LinearLayout = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(ui.dp(20), ui.dp(12), ui.dp(20), ui.dp(12))
+            addView(ui.row(title.also { it.layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f) }, duration.withStart(12)))
+            addView(
+                ui.row(time.withStart(0), kind.withStart(0), statusDot.apply {
+                    layoutParams = LinearLayout.LayoutParams(ui.dp(6), ui.dp(6)).apply { marginStart = ui.dp(10) }
+                }, status.withStart(6)).apply { setPadding(0, ui.dp(6), 0, 0) },
             )
+            addView(preview, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = ui.dp(6) })
+            tag = this@EntryRow
         }
-        root.addView(labelled(batteryView, batteryBtn))
 
-        root.addView(header("Seal token"))
-        tokenView = text(14f)
-        root.addView(tokenView)
-        tokenInput = EditText(this).apply {
-            hint = "534b5631…"
-            textSize = 12f
-            typeface = Typeface.MONOSPACE
-            // Keep the token out of keyboard learning and autofill.
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
-                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            imeOptions = EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
-            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
-            maxLines = 4
-            setHorizontallyScrolling(false)
-        }
-        root.addView(tokenInput)
-        tokenImport = row(button("Save pasted token") { importTokenText() }, button("Import file…") { pickTokenFile() })
-        root.addView(tokenImport)
-        forgetTokenBtn = button("Remove token from this phone") { forgetToken() }
-        root.addView(forgetTokenBtn)
-
-        root.addView(header("RTB"))
-        deviceView = text(14f)
-        forgetDeviceBtn = button("Forget") { forgetDevice() }
-        root.addView(labelled(deviceView, forgetDeviceBtn))
-
-        root.addView(header("Send audio to"))
-        sinkGroup = RadioGroup(this).apply {
-            addView(radio(ID_WS, "WebSocket: ws:// or wss:// URL"))
-            addView(radio(ID_TCP, "Raw TCP: plain AAC stream (netcat works)"))
-            addView(radio(ID_NONE, "Nowhere (phone recording only)"))
-            setOnCheckedChangeListener { _, _ -> showDestinationFields() }
-        }
-        root.addView(sinkGroup)
-        wsUrl = field("ws://100.101.102.103:8740/").apply { inputType = InputType.TYPE_TEXT_VARIATION_URI }
-        wsToken = field("Bearer token (optional)").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        wsBox = column(wsUrl, wsToken)
-        root.addView(wsBox)
-        tcpHost = field("Host or IP")
-        tcpPort = field("Port").apply { inputType = InputType.TYPE_CLASS_NUMBER }
-        tcpBox = row(tcpHost, tcpPort)
-        root.addView(tcpBox)
-        root.addView(text(12f).apply {
-            alpha = 0.7f
-            text = "Any address this phone can reach works: a Tailscale, WireGuard or OpenVPN IP, " +
-                "a LAN IP, or a public wss:// endpoint such as a Cloudflare Tunnel. " +
-                "Use wss:// whenever the path crosses the open internet."
-        })
-        recordBox = CheckBox(this).apply { text = "Also keep a copy on this phone" }
-        root.addView(recordBox)
-        root.addView(button("Save destination") { saveDestination() })
-
-        root.addView(header("Log"))
-        logView = text(11f).apply {
-            typeface = Typeface.MONOSPACE
-            setTextIsSelectable(true)
-        }
-        root.addView(logView)
-
-        val pad = dp(16)
-        return ScrollView(this).apply {
-            addView(root)
-            setOnApplyWindowInsetsListener { v, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
-                v.setPadding(pad + bars.left, pad + bars.top, pad + bars.right, pad + bars.bottom)
-                insets
+        fun bind(e: Entry) {
+            title.text = fmt.title(e)
+            duration.text = e.durationS?.takeIf { e.endedAt != null }?.let { Format.shortDuration(it) } ?: ""
+            // The fallback title already says the time.
+            time.visibility = if (fmt.hasRealTitle(e)) View.VISIBLE else View.GONE
+            time.text = fmt.clock(e.startedAt)
+            (time.layoutParams as LinearLayout.LayoutParams).marginEnd = ui.dp(10)
+            kind.text = fmt.kind(e).uppercase()
+            if (e.kind == Entry.Kind.COMMAND) {
+                kind.background = ui.rounded(ui.accent, 6)
+                kind.setTextColor(ui.onAccent)
+            } else {
+                kind.background = ui.rounded(ui.surface, 6)
+                kind.setTextColor(ui.fgMuted)
             }
+            status.text = fmt.status(e)
+            val c = statusColor(e.status)
+            status.setTextColor(if (e.status == Entry.Status.DONE) ui.fgMuted else c)
+            tint(statusDot, c)
+            preview.text = e.preview ?: e.error?.let { "Failed: $it" } ?: ""
+            preview.visibility = if (preview.text.isNullOrBlank()) View.GONE else View.VISIBLE
         }
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
-    private fun text(size: Float, bold: Boolean = false) = TextView(this).apply {
-        textSize = size
-        if (bold) setTypeface(typeface, Typeface.BOLD)
-    }
-
-    private fun header(title: String) = text(13f, bold = true).apply {
-        text = title.uppercase()
-        alpha = 0.6f
-        setPadding(0, dp(24), 0, dp(6))
-    }
-
-    private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
-        text = label
-        isAllCaps = false
-        setOnClickListener { onClick() }
-    }
-
-    private fun field(hint: String) = EditText(this).apply {
-        this.hint = hint
-        isSingleLine = true
-        textSize = 14f
-    }
-
-    private fun radio(id: Int, label: String) = RadioButton(this).apply {
-        this.id = id
-        text = label
-    }
-
-    private fun row(vararg views: View) = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        views.forEach { addView(it, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)) }
-    }
-
-    private fun column(vararg views: View) = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        views.forEach { addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
-    }
-
-    /** Text that takes the width, with a button at the end. */
-    private fun labelled(label: TextView, action: Button) = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        addView(label, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        addView(action, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
-    }
-
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-
-    private companion object {
-        const val REQ_PERMS = 1
-        const val REQ_TOKEN_FILE = 2
-        const val ID_WS = 101
-        const val ID_TCP = 102
-        const val ID_NONE = 103
+    private fun statusColor(s: Entry.Status) = when (s) {
+        Entry.Status.RECORDING, Entry.Status.FAILED -> ui.red
+        Entry.Status.DONE -> ui.green
+        else -> ui.accentText
     }
 }

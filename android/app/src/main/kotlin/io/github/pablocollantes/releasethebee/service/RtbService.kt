@@ -19,7 +19,9 @@ import android.os.Looper
 import android.os.PowerManager
 import io.github.pablocollantes.releasethebee.BuildConfig
 import io.github.pablocollantes.releasethebee.R
+import io.github.pablocollantes.releasethebee.rtb.RtbKey
 import io.github.pablocollantes.releasethebee.rtb.RtbLink
+import io.github.pablocollantes.releasethebee.rtb.hexToBytes
 import io.github.pablocollantes.releasethebee.sink.AudioFrame
 import io.github.pablocollantes.releasethebee.sink.AudioSink
 import io.github.pablocollantes.releasethebee.sink.FileSink
@@ -45,6 +47,9 @@ class RtbService : Service(), RtbLink.Listener {
     private var link: RtbLink? = null
     private var sinks: List<AudioSink> = emptyList()
     @Volatile private var session: SessionInfo? = null
+    @Volatile private var key: RtbKey? = null
+    /** The RTB's deviceId, for the receiver's hello. Null until a ctrKey-only key has bound. */
+    @Volatile private var deviceIdHex: String? = null
     private var frames = 0L
     private var lastNotified = 0L
 
@@ -84,6 +89,12 @@ class RtbService : Service(), RtbLink.Listener {
                 shutdown { begin() }
                 return START_STICKY
             }
+            ACTION_DEBUG_SEND -> {
+                val bytes = intent.getStringExtra(EXTRA_HEX)?.let { runCatching { it.hexToBytes() }.getOrNull() }
+                if (bytes == null) AppStatus.log("debug: pass the request as an even-length hex string")
+                else link?.debugSend(bytes) ?: AppStatus.log("debug: no RTB link")
+                return START_STICKY
+            }
         }
         // ACTION_START, or a sticky restart (null intent).
         if (!goForeground()) {
@@ -116,10 +127,10 @@ class RtbService : Service(), RtbLink.Listener {
     }
 
     private fun begin() {
-        val token = SecretStore(this).sealToken
+        val k = SecretStore(this).rtbKey
         val problem = when {
             !hasPermissions(this) -> "Bluetooth permission isn't granted"
-            token == null -> "import your RTB's seal token first"
+            k == null -> "import your RTB's key first"
             else -> null
         }
         if (problem != null) {
@@ -129,10 +140,12 @@ class RtbService : Service(), RtbLink.Listener {
             stopSelf()
             return
         }
-        sinks = buildSinks(token!!.deviceIdHex)
+        key = k
+        deviceIdHex = k!!.deviceIdHex
+        sinks = buildSinks()
         sinks.forEach { it.open() }
         AppStatus.update { it.copy(serviceRunning = true) }
-        link = RtbLink(this, token, settings.deviceAddress, settings.deviceAddressType, this).also {
+        link = RtbLink(this, k, settings.deviceAddress, settings.deviceAddressType, this).also {
             it.setPaused(settings.paused)
             it.start()
         }
@@ -158,15 +171,19 @@ class RtbService : Service(), RtbLink.Listener {
         }
     }
 
-    private fun buildSinks(deviceIdHex: String): List<AudioSink> {
+    private fun buildSinks(): List<AudioSink> {
         val list = mutableListOf<AudioSink>()
         val app = "release-the-bee-android/${BuildConfig.VERSION_NAME}"
         when (settings.sinkKind) {
             Settings.SinkKind.WEBSOCKET -> if (settings.wsUrl.isNotBlank()) {
                 list += WebSocketSink(
-                    settings.wsUrl, SecretStore(this).sinkToken, app, deviceIdHex,
+                    settings.wsUrl, SecretStore(this).sinkToken, app, { deviceIdHex },
                     sinkStatus("network"),
-                ) { msg -> AppStatus.log("receiver: ${msg.take(200)}") }
+                ) { e ->
+                    // Titles are the user's content: keep them out of the log.
+                    AppStatus.log("receiver: recording ${e.id.take(8)} is ${e.status ?: "updated"}")
+                    AppStatus.entryPushed(e)
+                }
             }
             Settings.SinkKind.TCP -> if (settings.tcpHost.isNotBlank()) {
                 list += TcpSink(settings.tcpHost, settings.tcpPort, sinkStatus("network"))
@@ -206,6 +223,16 @@ class RtbService : Service(), RtbLink.Listener {
         settings.deviceAddress = address
         settings.deviceAddressType = addressType
         AppStatus.log("remembered RTB at $address")
+    }
+
+    override fun onDeviceBound(deviceId: ByteArray) {
+        val bound = (key as? RtbKey.CtrOnly)?.boundTo(deviceId) ?: return
+        key = bound
+        deviceIdHex = bound.deviceIdHex
+        // Persist the binding, unless the user replaced the key in the meantime.
+        val secrets = SecretStore(this)
+        val stored = secrets.rtbKey
+        if (stored != null && stored.sameKeyAs(bound)) secrets.rtbKey = bound
     }
 
     override fun onStreamStart(deviceIdHex: String) {
@@ -296,6 +323,9 @@ class RtbService : Service(), RtbLink.Listener {
         const val ACTION_PAUSE = "io.github.pablocollantes.releasethebee.PAUSE"
         const val ACTION_RESUME = "io.github.pablocollantes.releasethebee.RESUME"
         const val ACTION_RELOAD = "io.github.pablocollantes.releasethebee.RELOAD"
+        /** Debug builds only, from adb: see `src/debug/…/DebugReceiver.kt`. */
+        const val ACTION_DEBUG_SEND = "io.github.pablocollantes.releasethebee.DEBUG_SEND"
+        const val EXTRA_HEX = "hex"
 
         private const val CHANNEL = "link"
         private const val NOTIFICATION_ID = 1

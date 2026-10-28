@@ -28,14 +28,18 @@ abstract class NetworkSink(
     @Volatile private var running = false
     private var worker: Thread? = null
 
-    /** The session the receiver currently knows about, re-announced after a reconnect. */
-    private var current: SessionInfo? = null
+    /**
+     * Sessions the receiver currently knows about, outermost first, re-announced after a
+     * reconnect: none, one, or a parent with the child (command) recorded inside it.
+     * Only the worker thread touches it.
+     */
+    private val open = ArrayList<SessionInfo>()
 
     /** Open the connection; throw on failure. */
     protected abstract fun connect()
 
-    /** Called right after each successful [connect]. */
-    protected abstract fun greet(resume: SessionInfo?)
+    /** Called right after each successful [connect], with the sessions still open, parent first. */
+    protected abstract fun greet(open: List<SessionInfo>)
 
     /** Send one item; throw if the connection is gone. */
     protected abstract fun send(item: Item)
@@ -80,13 +84,29 @@ abstract class NetworkSink(
         if (item is Item.Audio) audioQueued++
     }
 
+    /** Keep [open] in step with what the receiver has been told. */
+    private fun track(item: Item) {
+        when (item) {
+            is Item.Start -> {
+                if (item.s.parentId == null) open.clear()       // a new top-level session replaces everything
+                else open.removeAll { it.parentId != null }      // at most one level of nesting
+                open += item.s
+            }
+            is Item.End -> {
+                val i = open.indexOfFirst { it.id == item.s.id }
+                if (i >= 0) while (open.size > i) open.removeAt(open.lastIndex)   // ending a parent ends its child
+            }
+            is Item.Audio -> {}
+        }
+    }
+
     private fun loop() {
         var attempt = 0
         while (running) {
             try {
                 onStatus("connecting")
                 connect()
-                greet(current)
+                greet(open.toList())
                 attempt = 0
                 onStatus("connected")
                 while (running) {
@@ -97,11 +117,7 @@ abstract class NetworkSink(
                         putBack(item)
                         throw e
                     }
-                    when (item) {
-                        is Item.Start -> current = item.s
-                        is Item.End -> current = null
-                        is Item.Audio -> {}
-                    }
+                    track(item)
                 }
             } catch (e: InterruptedException) {
                 break

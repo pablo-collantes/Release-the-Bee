@@ -14,14 +14,18 @@ import java.util.concurrent.TimeUnit
  * Streams rtb-stream/1 to a ws:// or wss:// URL. This is the general-purpose sink: the
  * receiver can sit behind a VPN address, a LAN IP, a reverse proxy, a Cloudflare tunnel
  * or a relay. An optional bearer token is sent as `Authorization: Bearer …`.
+ *
+ * The receiver talks back on the same connection: `entry` pushes (a recording's entry
+ * changed) go to [onEntry], so the app never has to poll. Other messages are ignored.
+ * [deviceIdHex] is read at every connect, because a ctrKey-only key learns its RTB late.
  */
 class WebSocketSink(
     private val url: String,
     private val bearer: String?,
     private val app: String,
-    private val deviceIdHex: String,
+    private val deviceIdHex: () -> String?,
     onStatus: (String) -> Unit,
-    private val onServerMessage: (String) -> Unit,
+    private val onEntry: (EntryPush) -> Unit,
 ) : NetworkSink("ws", onStatus) {
 
     private val client = OkHttpClient.Builder()
@@ -41,7 +45,9 @@ class WebSocketSink(
         ws = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = opened.countDown()
 
-            override fun onMessage(webSocket: WebSocket, text: String) = onServerMessage(text)
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                StreamProtocol.parseServerMessage(text)?.let(onEntry)
+            }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 failure = "receiver closed the connection ($code${if (reason.isNotEmpty()) " $reason" else ""})"
@@ -62,9 +68,9 @@ class WebSocketSink(
         failure?.let { throw IOException(it) }
     }
 
-    override fun greet(resume: SessionInfo?) {
-        sendText(StreamProtocol.hello(app, deviceIdHex))
-        resume?.let { sendText(StreamProtocol.sessionStart(it, resumed = true)) }
+    override fun greet(open: List<SessionInfo>) {
+        sendText(StreamProtocol.hello(app, deviceIdHex()))
+        open.forEach { sendText(StreamProtocol.sessionStart(it, resumed = true)) }
     }
 
     override fun send(item: Item) {

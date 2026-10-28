@@ -29,8 +29,13 @@ import kotlin.math.min
  *                                       → GetSecureIds (sealed?) ─┤
  *       → GetSessionNonce → SetDeviceState(RECORDING) → audio ◀──┘
  *
- * The device ID in GetSecureIds must match the token's, so a scan can never latch onto
- * somebody else's RTB. Once streaming, a lost link is re-dialled with autoConnect, which
+ * The device ID in GetSecureIds must match the key's, so a scan can never latch onto
+ * somebody else's RTB. A full seal token names its device. A bare ctrKey doesn't: the
+ * link binds it to the first RTB it reaches ([Listener.onDeviceBound]) and holds it to
+ * that one from then on. A ctrKey can't seal, so an unsealed RTB is a dead end for it,
+ * and audio that never decrypts (even after a fresh nonce) means it's the wrong key.
+ *
+ * Once streaming, a lost link is re-dialled with autoConnect, which
  * lets the Bluetooth stack wait for the RTB to come back in range instead of polling.
  *
  * Everything runs on one private HandlerThread (GATT callbacks included), so there are
@@ -39,7 +44,7 @@ import kotlin.math.min
 @SuppressLint("MissingPermission") // the service checks BLUETOOTH_SCAN/CONNECT before start()
 class RtbLink(
     private val ctx: Context,
-    private val token: SealToken,
+    private val key: RtbKey,
     knownAddress: String?,
     private val knownAddressType: Int,
     private val listener: Listener,
@@ -50,10 +55,12 @@ class RtbLink(
         fun onState(state: State, detail: String)
         fun onLog(line: String)
         /**
-         * A scanned device proved to be the token's RTB: remember it for next time.
+         * A scanned device proved to be the key's RTB: remember it for next time.
          * [addressType] is BluetoothDevice.ADDRESS_TYPE_PUBLIC/RANDOM, or -1 if unknown.
          */
         fun onAddressConfirmed(address: String, addressType: Int)
+        /** A ctrKey-only key reached its first RTB: remember [deviceId] and accept no other. */
+        fun onDeviceBound(deviceId: ByteArray)
         fun onStreamStart(deviceIdHex: String)
         fun onAudio(seq: Long, adts: ByteArray)
         fun onStreamEnd(reason: String)
@@ -80,6 +87,9 @@ class RtbLink(
     private var streaming = false
     private var undecodable = 0                      // consecutive notifications with no AAC in them
     private var lastNonceRefresh = 0L
+    private var keyProven = false                    // some audio has decrypted to AAC with this key
+    private var deviceId: ByteArray? = key.deviceId  // the RTB we answer to (null: a ctrKey not bound yet)
+    private val deviceHex: String get() = deviceId?.toHex() ?: "?"
 
     // Android runs one GATT operation at a time; queue them.
     private val ops = ArrayDeque<() -> Unit>()
@@ -410,13 +420,18 @@ class RtbLink(
             RtbProtocol.OP_GET_SECURE_IDS -> {
                 if (step != Step.IDS && step != Step.IDS_AFTER_SEAL) return
                 val ids = SecureIds.parse(r.payload) ?: return onLinkDown("RTB sent a short SecureIds reply")
-                if (!ids.deviceId.contentEquals(token.deviceId)) return wrongDevice(ids)
+                val expected = deviceId
+                if (expected != null && !ids.deviceId.contentEquals(expected)) return wrongDevice(ids)
+                if (!ids.sealed && key !is RtbKey.Full) {
+                    return fail("This RTB isn't sealed. A ctrKey alone can't reseal it; import the full 108-byte token.")
+                }
+                if (expected == null) bind(ids.deviceId)
                 confirmAddress()
                 when {
                     ids.sealed -> afterSealed()
                     step == Step.IDS -> {
                         setState(State.SEALING, "RTB isn't sealed; sealing it with your token")
-                        send(Step.SEAL, RtbProtocol.setEncryptionKey(token))
+                        send(Step.SEAL, RtbProtocol.setEncryptionKey((key as RtbKey.Full).token))
                     }
                     else -> fail("the RTB accepted the token but still reports unsealed")
                 }
@@ -427,7 +442,7 @@ class RtbLink(
             }
             RtbProtocol.OP_GET_SESSION_NONCE -> if (step == Step.NONCE) {
                 if (r.payload.size < 12) return onLinkDown("RTB sent a short session nonce")
-                decryptor = AudioDecryptor(token.ctrKey(), r.payload.copyOf(12))
+                decryptor = AudioDecryptor(key.ctrKey(), r.payload.copyOf(12))
                 undecodable = 0
                 send(Step.RECORD, RtbProtocol.setDeviceState(RtbProtocol.STATE_RECORDING))
             }
@@ -441,8 +456,19 @@ class RtbLink(
                 }
                 else -> {}
             }
-            else -> log("RTB ok 0x%04x".format(r.op))
+            else -> log("RTB ok 0x%04x %s".format(r.op, r.payload.toHex()))
         }
+    }
+
+    /**
+     * Developer probe: write raw [bytes] to the control characteristic. The reply (or
+     * event) lands in the log through the normal paths. Refused mid-handshake, so it
+     * can't be mistaken for a handshake reply.
+     */
+    fun debugSend(bytes: ByteArray) = post {
+        if (gatt == null || step != null) return@post log("debug: link busy or down; not sending ${bytes.toHex()}")
+        log("debug → ${bytes.toHex()}")
+        writeControl(bytes)
     }
 
     /**
@@ -495,6 +521,13 @@ class RtbLink(
         listener.onAddressConfirmed(g.device.address, type)
     }
 
+    /** A ctrKey-only key meets its RTB: from now on, only this deviceId is accepted. */
+    private fun bind(id: ByteArray) {
+        deviceId = id.copyOf()
+        log("your ctrKey is now bound to RTB ${id.toHex()}")
+        listener.onDeviceBound(id.copyOf())
+    }
+
     private fun wrongDevice(ids: SecureIds) {
         val addr = gatt?.device?.address ?: "?"
         if (verifying) {
@@ -502,9 +535,10 @@ class RtbLink(
             log("$addr is a different RTB (device ${ids.deviceId.toHex()}); still looking")
             onLinkDown("not our RTB")
         } else {
+            val whose = if (key is RtbKey.Full) "your token is for" else "your ctrKey is bound to"
             fail(
-                "the RTB at $addr is device ${ids.deviceId.toHex()}, but your token is for " +
-                    "device ${token.deviceIdHex}. Forget the device and start again to scan.",
+                "the RTB at $addr is device ${ids.deviceId.toHex()}, but $whose " +
+                    "device $deviceHex. Forget the device and start again to scan.",
             )
         }
     }
@@ -525,8 +559,8 @@ class RtbLink(
         if (streaming) return
         streaming = true
         attempts = 0
-        setState(State.STREAMING, "streaming from RTB ${token.deviceIdHex}")
-        listener.onStreamStart(token.deviceIdHex)
+        setState(State.STREAMING, "streaming from RTB $deviceHex")
+        listener.onStreamStart(deviceHex)
     }
 
     private fun endStream(reason: String) {
@@ -544,12 +578,20 @@ class RtbLink(
         val f = dec.decrypt(d) ?: return
         if (f.containsAdtsSync) {
             undecodable = 0
+            keyProven = true
         } else if (++undecodable == STALE_NONCE_FRAMES && step == null) {
             val now = System.currentTimeMillis()
             if (now - lastNonceRefresh > 60_000) {
                 lastNonceRefresh = now
                 log("frames stopped decrypting to AAC; fetching a fresh nonce")
                 send(Step.NONCE, RtbProtocol.getSessionNonce())
+            } else if (!keyProven && key is RtbKey.CtrOnly) {
+                // A token's ctrKey belongs to the device it was checked against; a bare
+                // ctrKey that has never produced AAC, even with a fresh nonce, is the wrong key.
+                return fail(
+                    "Your ctrKey doesn't decrypt the audio of RTB $deviceHex. Check the key, or " +
+                        "import the full 108-byte token. If this isn't your RTB, Forget it in Settings.",
+                )
             } else {
                 log("frames still don't decrypt to AAC after a nonce refresh")
             }

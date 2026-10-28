@@ -35,6 +35,11 @@ class Settings(ctx: Context) {
         get() = p.getInt("tcp_port", 8741)
         set(v) = p.edit().putInt("tcp_port", v).apply()
 
+    /**
+     * Also write each recording to the phone. Off unless the user turned it on: the
+     * player streams recordings from the receiver, so a phone copy is rarely needed.
+     * (0.1 also defaulted to off and saved the checkbox, so existing choices carry over.)
+     */
     var recordOnPhone: Boolean
         get() = p.getBoolean("record_on_phone", false)
         set(v) = p.edit().putBoolean("record_on_phone", v).apply()

@@ -14,9 +14,13 @@ class NetworkSinkTest {
         NetworkSink("fake", {}, max) {
         val got = CopyOnWriteArrayList<String>()
         val greetings = CopyOnWriteArrayList<String?>()
-        var failNextAudio = false
+        @Volatile var failNextAudio = false
         override fun connect() { if (up.count > 0) throw IOException("down") }
-        override fun greet(resume: SessionInfo?) { greetings += resume?.id }
+        val reopened = CopyOnWriteArrayList<List<String>>()
+        override fun greet(open: List<SessionInfo>) {
+            greetings += open.firstOrNull()?.id
+            reopened += open.map { it.id }
+        }
         override fun send(item: Item) {
             if (item is Item.Audio && failNextAudio) { failNextAudio = false; throw IOException("drop") }
             got += when (item) {
@@ -61,5 +65,31 @@ class NetworkSinkTest {
         sink.close()
         assertEquals(listOf("start:s2", "audio:1", "audio:2"), sink.got)  // frame 1 retried, not lost
         assertEquals(listOf(null, "s2"), sink.greetings.take(2))          // second hello resumes s2
+    }
+
+    @Test fun `re-announces a nested command after its parent, and only the parent once it ends`() {
+        val sink = FakeSink(max = 100, CountDownLatch(0), CountDownLatch(0))
+        val parent = SessionInfo("p", "dev", 0)
+        val child = SessionInfo("c", "dev", 1, SessionInfo.Kind.COMMAND, SessionInfo.Trigger.DOUBLE_PRESS, parentId = "p")
+        sink.failNextAudio = true                 // the connection drops while the command is open
+        sink.sessionStart(parent)
+        sink.sessionStart(child)
+        sink.audio(frame(1))
+        sink.sessionEnd(child, "done")
+        sink.audio(frame(2))
+        sink.open()
+        awaitSize(sink.got, 5)
+        sink.failNextAudio = true                 // and again, after the command has ended
+        sink.audio(frame(3))
+        awaitSize(sink.got, 6)
+        sink.close()
+        assertEquals(listOf("start:p", "start:c", "audio:1", "end:c", "audio:2", "audio:3"), sink.got)
+        assertEquals(listOf(emptyList(), listOf("p", "c"), listOf("p")), sink.reopened.toList())
+    }
+
+    private fun awaitSize(list: List<*>, n: Int) {
+        val deadline = System.currentTimeMillis() + 10_000
+        while (list.size < n && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertEquals(n, list.size)
     }
 }

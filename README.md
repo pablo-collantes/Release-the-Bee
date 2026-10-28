@@ -24,8 +24,8 @@ We call the device the **RTB** (as in *Release the Bee*).
 |---|---|
 | BLE protocol: seal, nonce, decrypt | Proven on real hardware with an earlier test rig |
 | Android app: always-on service, auto-reconnect, auto-reseal, WebSocket/TCP/on-phone sinks | **New, first release.** Builds and passes unit tests; end-to-end hardware testing in progress |
-| Receiver: saves sessions, resumes after network drops, runs a hook per recording | Works and is tested |
-| Local transcription with diarization | Next |
+| Receiver: saves sessions, resumes after network drops, serves entries over HTTP | Works and is tested |
+| Local transcription, speakers, summaries and voice commands | **New.** Works on real recordings (whisper.cpp, sherpa-onnx, Gemma 4 E4B) |
 | Cloudflare relay, spill-to-disk buffering, extracting the token inside the app | Planned |
 
 ## Quick start
@@ -42,23 +42,130 @@ We call the device the **RTB** (as in *Release the Bee*).
    ```sh
    python3 receiver/rtb_receiver.py --token "$(openssl rand -hex 16)"
    ```
-4. **In the app:**
-   1. Under *Setup*, tap **Allow** and **Unrestrict**.
-   2. Import the seal token.
+4. **In the app,** open **Settings** (the gear, or tap the status card):
+   1. Under *This phone*, tap **Allow** and **Unrestrict**.
+   2. Under *RTB key*, import the seal token. A bare 16-byte ctrKey also works: it
+      decrypts audio but can't reseal the RTB after a reset, so keep the full token if
+      you have it.
    3. Under *Send audio to*, enter `ws://<your-machine>:8740/` and the token, then tap
       **Save destination**.
    4. Tap **Start**. The first start scans for your RTB. After that the app reconnects on
       its own, including after a reboot.
 
-Recordings land in `recordings/<device>/<date>/<time>_<session>.aac`. To transcribe each
-one when it finishes:
+   The main screen lists your recordings, newest first, once the receiver serves them
+   ([docs/SERVER_API.md](docs/SERVER_API.md)): the summary, the transcript with speakers,
+   and a player that streams the audio from the receiver. The RTB's own button mutes and
+   unmutes it.
 
-```sh
-python3 receiver/rtb_receiver.py --token … --on-session-end \
-  'ffmpeg -loglevel error -i {path} -ar 16000 -ac 1 {path}.wav && whisper-cli -m path/to/ggml-large-v3.bin -f {path}.wav -otxt'
+Recordings land in `recordings/<device>/<date>/<time>_<session>.aac`. With only the
+standard library, the receiver saves them and serves the audio. To get transcripts and
+summaries, set up processing.
+
+## Transcripts, speakers and summaries
+
+When a recording ends, the receiver turns it into an *entry*
+([docs/SERVER_API.md](docs/SERVER_API.md)), one at a time, oldest first:
+
+```
+.aac → 16 kHz WAV, high-pass → who speaks when → whisper on the speech only → summary or command
 ```
 
-(`{path}` is shell-quoted for you, so `{path}.wav` becomes `<recording>.aac.wav`.)
+Each step runs if its tool is configured and is skipped otherwise. The entry still
+finishes with what it has.
+
+| Step | Needs | Flags |
+|---|---|---|
+| Seekable M4A, audio clean-up | `ffmpeg` | `--ffmpeg` (default: on `PATH`) |
+| Transcript | a [whisper.cpp](https://github.com/ggml-org/whisper.cpp) server, or `whisper-cli` | `--whisper-url`, or `--whisper-cli` + `--whisper-model`; `--language` |
+| Speakers, and skipping silence (where whisper invents text) | `sherpa-onnx` and its models | `--sherpa-dir`; `--speakers N` if you know it |
+| Summary (unmute) or command (double press, hold) | any OpenAI-compatible chat endpoint | `--llm-url`, `--llm-model`, `--llm-key`, `--llm-context`, `--llm-chunk` |
+
+Install sherpa-onnx in a venv and fetch its models once (about 33 MB):
+
+```sh
+python3 -m venv receiver/.venv
+receiver/.venv/bin/pip install sherpa-onnx numpy
+mkdir -p ~/models/sherpa-onnx-diarization && cd ~/models/sherpa-onnx-diarization
+rel=https://github.com/k2-fsa/sherpa-onnx/releases/download
+curl -L $rel/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar xj
+curl -LO $rel/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
+```
+
+A small LLM is enough: the prompts are tuned for Gemma 4 E4B. Serve it with llama.cpp,
+thinking off, and a context that holds a long meeting (longer transcripts are summarized
+in parts):
+
+```sh
+llama-server -m gemma-4-E4B-it-Q4_K_M.gguf --alias gemma-4-e4b --port 8742 -c 32768 -ngl 99 --reasoning off
+```
+
+Then start the receiver with the venv's Python:
+
+```sh
+receiver/.venv/bin/python receiver/rtb_receiver.py --token … \
+  --whisper-url http://127.0.0.1:8009 \
+  --sherpa-dir ~/models/sherpa-onnx-diarization \
+  --llm-url http://127.0.0.1:8742/v1 --llm-model gemma-4-e4b
+```
+
+`receiver/.venv/bin/python receiver/rtb_process.py <recording.aac> [same flags]` processes
+one file and prints the result. `--on-session-end CMD` still runs your own command per
+recording.
+
+On an AMD Strix Halo (whisper large-v3 on the iGPU with Vulkan, diarization on 16 CPU
+threads, Gemma 4 E4B Q4_K_M), a 1 h 50 min meeting takes about 9 minutes: 4 for
+diarization, 4 for whisper, 30 s for the summary. A voice command takes 2 to 3 seconds.
+
+### As systemd user services
+
+`~/.config/systemd/user/rtb-llm.service`:
+
+```ini
+[Unit]
+Description=Gemma 4 E4B for Release the Bee
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/llama-server -m %h/models/gemma-4-e4b/gemma-4-E4B-it-Q4_K_M.gguf \
+  --alias gemma-4-e4b --host 127.0.0.1 --port 8742 -c 32768 -ngl 99 --reasoning off
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+`~/.config/systemd/user/rtb-receiver.service` (bound to a Tailscale address, so it waits
+for that address to exist):
+
+```ini
+[Unit]
+Description=Release the Bee receiver
+Wants=rtb-llm.service
+After=rtb-llm.service
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=%h/Release-the-Bee
+ExecStartPre=/bin/sh -c 'until ip -4 addr | grep -qF " 100.x.y.z/"; do sleep 2; done'
+ExecStart=%h/Release-the-Bee/receiver/.venv/bin/python receiver/rtb_receiver.py \
+  --ws 100.x.y.z:8740 --out %h/Release-the-Bee/recordings \
+  --whisper-url http://127.0.0.1:8009 --sherpa-dir %h/models/sherpa-onnx-diarization \
+  --llm-url http://127.0.0.1:8742/v1 --llm-model gemma-4-e4b
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload && systemctl --user enable --now rtb-llm rtb-receiver
+journalctl --user -u rtb-receiver -f
+```
+
+For a token, add `Environment=RTB_TOKEN=…` (or keep it in a file and use
+`EnvironmentFile=`) rather than putting it on the command line.
 
 ## Getting audio to your machine
 
@@ -77,7 +184,7 @@ for the RTB to come back in range: no polling, and little battery cost while it'
 
 Android kills background work aggressively, so:
 
-- Tap **Unrestrict** in the app (it opens Android's "unrestricted battery" prompt).
+- Tap **Unrestrict** in the app's Settings (it opens Android's "unrestricted battery" prompt).
 - **Samsung:** also add the app under *Settings → Battery → Background usage limits →
   Never sleeping apps*.
 - From a computer, this does the same as Unrestrict:
@@ -85,9 +192,9 @@ Android kills background work aggressively, so:
 
 ## Security
 
-- **The seal token is a per-device secret.** The app stores it encrypted under an
-  Android Keystore key, never logs it, and opts out of backups. It never belongs in
-  this repository.
+- **The seal token is a per-device secret** (and so is its ctrKey). The app stores it
+  encrypted under an Android Keystore key, never logs it, and opts out of backups. It
+  never belongs in this repository.
 - **This repo guards against leaking one.** Enable the hooks once per clone:
   `git config core.hooksPath .githooks`. Commits and pushes containing a token (raw, hex
   or base64), `*.token` files, snoop logs or keystores are refused. See
@@ -115,9 +222,11 @@ keytool -genkey -keystore android/debug.keystore -alias androiddebugkey -keyalg 
 
 ```
 android/    the app (Kotlin, no AndroidX; OkHttp for WebSockets)
-receiver/   rtb_receiver.py: standard-library receiver
+receiver/   rtb_receiver.py (WebSocket + HTTP), rtb_entries.py (entries on disk),
+            rtb_process.py (transcript, speakers, summary), tests/ (python3 -m unittest
+            discover -s receiver/tests)
 tools/      parse_bee_token.py (token capture), secret_guard.py (git hooks)
-docs/       RTB BLE protocol, phone→receiver stream protocol, transport recipes
+docs/       RTB BLE protocol, phone→receiver stream protocol, receiver API, transports
 ```
 
 ## License

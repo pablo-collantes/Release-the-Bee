@@ -29,11 +29,25 @@ When the RTB starts streaming:
 
 ```json
 {"type":"session_start","session":"<uuid>","device":"<deviceId hex>",
- "started_at":1761580000000,"resumed":false}
+ "started_at":1761580000000,"resumed":false,
+ "kind":"summary","trigger":"button","parent":null}
 ```
 
 `resumed: true` means the network dropped mid-session and the app reconnected. The
 `session` id is the same, so append to the same recording.
+
+`hello`'s `device` can be `null` (the app hasn't met its RTB yet); `session_start`
+always carries it, so file recordings by the session's `device`.
+
+`kind` says what the recording is for: `summary` (the default if missing) or `command`.
+`trigger` says which button gesture started it: `button`, `double_press`, `hold`, `app`.
+See [SERVER_API.md](SERVER_API.md) for what the receiver does with each kind.
+
+**Nested recordings.** A command can be recorded in the middle of a summary recording
+(the user double-presses during a meeting). The app then sends a `session_start` with
+`parent` set to the open summary's id. Audio goes to the command until its
+`session_end`, then back to the parent, which never closed. There is at most one level
+of nesting. The command's audio is not part of the parent's recording.
 
 When the RTB stops (the link dropped, the user paused, or the app stopped):
 
@@ -59,9 +73,14 @@ waits 10 minutes).
 
 ### Messages to the phone
 
-The app logs any text message it receives and ignores it otherwise. A later version
-will show live transcripts sent back this way, as
-`{"type":"transcript", …}`.
+The receiver tells the app when a recording's entry changes (queued, transcribed,
+summarized), so the app can refresh without polling:
+
+```json
+{"type":"entry","id":"<session uuid>","kind":"summary","status":"done","title":"…"}
+```
+
+The app ignores message types it doesn't know.
 
 ## Buffering
 

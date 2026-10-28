@@ -11,7 +11,7 @@
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- Sending audio to the user's receiver -->
+    <!-- Sending audio to the user's receiver, and reading recordings back from it -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- Staying connected in the background -->
@@ -41,6 +41,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ui.EntryActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".service.RtbService"

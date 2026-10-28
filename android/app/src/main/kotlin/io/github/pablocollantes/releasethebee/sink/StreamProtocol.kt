@@ -1,5 +1,6 @@
 package io.github.pablocollantes.releasethebee.sink
 
+import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -14,7 +15,8 @@ object StreamProtocol {
     const val NAME = "rtb-stream/1"
     const val AUDIO_HEADER_LEN = 12
 
-    fun hello(app: String, deviceIdHex: String) = json(
+    /** [deviceIdHex] is null while a ctrKey-only key hasn't reached its RTB yet. */
+    fun hello(app: String, deviceIdHex: String?) = json(
         "type" to "hello",
         "protocol" to NAME,
         "app" to app,
@@ -30,6 +32,9 @@ object StreamProtocol {
         "device" to s.deviceIdHex,
         "started_at" to s.startedAtMs,
         "resumed" to resumed,
+        "kind" to s.kind.wire,
+        "trigger" to s.trigger?.wire,
+        "parent" to s.parentId,
     )
 
     fun sessionEnd(s: SessionInfo, reason: String) = json(
@@ -37,6 +42,19 @@ object StreamProtocol {
         "session" to s.id,
         "reason" to reason,
     )
+
+    /**
+     * A text message from the receiver. Only `entry` pushes mean anything to the app
+     * (docs/SERVER_API.md); anything else, including malformed JSON, is null and ignored.
+     */
+    fun parseServerMessage(text: String): EntryPush? = runCatching {
+        val o = JSONObject(text)
+        if (o.optString("type") != "entry") return null
+        val id = o.optString("id").takeIf { it.isNotEmpty() } ?: return null
+        EntryPush(id, o.str("kind"), o.str("status"), o.str("title"))
+    }.getOrNull()
+
+    private fun JSONObject.str(k: String): String? = if (isNull(k)) null else optString(k)
 
     fun audio(f: AudioFrame): ByteArray =
         ByteBuffer.allocate(AUDIO_HEADER_LEN + f.adts.size).order(ByteOrder.BIG_ENDIAN)
@@ -66,3 +84,6 @@ object StreamProtocol {
         append('"')
     }
 }
+
+/** `{"type":"entry",…}`: a recording's entry changed on the receiver. Fetch it if you need more. */
+class EntryPush(val id: String, val kind: String?, val status: String?, val title: String?)

@@ -27,7 +27,7 @@ class TcpSink(
         out = s.getOutputStream()
     }
 
-    override fun greet(resume: SessionInfo?) {}
+    override fun greet(open: List<SessionInfo>) {}
 
     override fun send(item: Item) {
         if (item is Item.Audio) out!!.write(item.f.adts)

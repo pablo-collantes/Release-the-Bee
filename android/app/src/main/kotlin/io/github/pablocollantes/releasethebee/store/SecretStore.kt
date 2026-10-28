@@ -3,7 +3,7 @@ package io.github.pablocollantes.releasethebee.store
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import io.github.pablocollantes.releasethebee.rtb.SealToken
+import io.github.pablocollantes.releasethebee.rtb.RtbKey
 import java.security.GeneralSecurityException
 import java.security.KeyStore
 import java.util.Base64
@@ -21,9 +21,14 @@ class SecretStore(ctx: Context) {
 
     private val prefs = ctx.getSharedPreferences("secrets", Context.MODE_PRIVATE)
 
-    var sealToken: SealToken?
-        get() = getBytes(SEAL_TOKEN)?.let { runCatching { SealToken.fromBytes(it) }.getOrNull() }
-        set(v) = putBytes(SEAL_TOKEN, v?.bytes())
+    /**
+     * The RTB key: a full seal token or a bare ctrKey (with the RTB it bound to).
+     * Stored under the 0.1 name: a full token is still its 108 raw bytes, so a token
+     * saved before ctrKey support reads back as [RtbKey.Full] with no migration step.
+     */
+    var rtbKey: RtbKey?
+        get() = getBytes(RTB_KEY)?.let { runCatching { RtbKey.decode(it) }.getOrNull() }
+        set(v) = putBytes(RTB_KEY, v?.encode())
 
     /** Optional bearer token for the WebSocket receiver or relay. */
     var sinkToken: String?
@@ -71,7 +76,7 @@ class SecretStore(ctx: Context) {
         const val ALIAS = "rtb-secrets"
         const val TRANSFORM = "AES/GCM/NoPadding"
         const val IV_LEN = 12
-        const val SEAL_TOKEN = "seal_token"
+        const val RTB_KEY = "seal_token"     // the 0.1 name, kept so stored tokens keep working
         const val SINK_TOKEN = "sink_token"
     }
 }

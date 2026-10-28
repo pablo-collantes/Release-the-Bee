@@ -12,11 +12,12 @@ bugreport*.zip
 # key would let anyone build an "update" that inherits your installed app's data)
 *.keystore
 *.jks
-# Audio
+# Audio, and the entries/transcripts the receiver writes next to it
 /recordings/
 receiver/recordings/
 *.aac
 *.wav
+*.m4a
 
 # ---- Android / Gradle --------------------------------------------------------
 .gradle/
@@ -34,3 +35,5 @@ captures/
 __pycache__/
 *.pyc
 .venv/
+# The receiver's machine-local venv (sherpa-onnx for diarization)
+/receiver/.venv/
