@@ -102,6 +102,7 @@ class RtbLink(
     private var blinkGen = 0
     private var blinkSeen = 0                        // state events during the blink...
     private var blinkLast: Boolean? = null           // ...and the last one (true = recording)
+    private var holdStartedAt = 0L                   // a hold registered: the RTB unmutes itself
     private var holdEndedAt = 0L                     // its button let go of: the RTB mutes itself
     private var batteryAsked = false                 // once per connection; it reports changes itself
     private var stateTests = 0                       // sleep requests awaiting their reply
@@ -607,7 +608,7 @@ class RtbLink(
             RtbProtocol.TAG_EVENT_DOUBLE_PRESS -> return button(Button.DOUBLE_PRESS)
             RtbProtocol.TAG_EVENT_HOLD -> {
                 val start = e.payload.firstOrNull()?.toInt() == 1
-                if (!start) holdEndedAt = SystemClock.elapsedRealtime()
+                if (start) holdStartedAt = SystemClock.elapsedRealtime() else holdEndedAt = SystemClock.elapsedRealtime()
                 return button(if (start) Button.HOLD_START else Button.HOLD_END)
             }
             RtbProtocol.TAG_EVENT_BATTERY -> return e.payload.firstOrNull()?.let { listener.onBattery(it.toInt() and 0xFF, null) } ?: Unit
@@ -627,6 +628,13 @@ class RtbLink(
     private fun deviceState(recording: Boolean) {
         if (recording == wanted && recording == streaming) return         // what we asked for
         val now = SystemClock.elapsedRealtime()
+        if (recording && now - holdStartedAt < STATE_SETTLE_MS) {
+            // The RTB unmutes itself when a hold registers. That isn't its single press, so
+            // not a new resting state: what the hold means is the Recorder's call, and it
+            // asks with setRecording (temporary for a command).
+            holdStartedAt = 0
+            return
+        }
         if (!recording && now - holdEndedAt < STATE_SETTLE_MS) {
             // The RTB mutes itself when its button is let go after a hold. That ends the
             // command; whether to record again is the resting state's call (if it was

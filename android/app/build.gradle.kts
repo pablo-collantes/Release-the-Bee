@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.pablocollantes.releasethebee"
         minSdk = 33          // Android 13: new BLE permission model + value-carrying GATT callbacks
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.4.1"
+        versionCode = 6
+        versionName = "0.4.2"
     }
 
     signingConfigs {
