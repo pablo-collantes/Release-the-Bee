@@ -89,6 +89,12 @@ class RtbService : Service(), RtbLink.Listener {
                 link?.setPaused(pause)
                 if (link != null) return START_STICKY
             }
+            ACTION_WARM_MUTE -> {
+                link?.setWarmMute(settings.warmMute)
+                if (link != null || AppStatus.snapshot.serviceRunning) return START_STICKY
+                stopSelf()
+                return START_NOT_STICKY
+            }
             ACTION_RELOAD -> if (link != null) {
                 shutdown { begin() }
                 return START_STICKY
@@ -176,7 +182,7 @@ class RtbService : Service(), RtbLink.Listener {
         // Muted by its button stays muted, even across a restart. With unmuting set to record
         // commands, the RTB rests muted until a press.
         val recordOnConnect = settings.rtbRecording && settings.unmuteKind == SessionInfo.Kind.SUMMARY
-        link = RtbLink(this, k, settings.deviceAddress, settings.deviceAddressType, this, recordOnConnect).also {
+        link = RtbLink(this, k, settings.deviceAddress, settings.deviceAddressType, this, recordOnConnect, settings.warmMute).also {
             it.setPaused(settings.paused)
             it.start()
         }
@@ -435,6 +441,8 @@ class RtbService : Service(), RtbLink.Listener {
         const val ACTION_PAUSE = "io.github.pablocollantes.releasethebee.PAUSE"
         const val ACTION_RESUME = "io.github.pablocollantes.releasethebee.RESUME"
         const val ACTION_RELOAD = "io.github.pablocollantes.releasethebee.RELOAD"
+        /** Settings changed [Settings.warmMute]. */
+        const val ACTION_WARM_MUTE = "io.github.pablocollantes.releasethebee.WARM_MUTE"
         /** Requests from the light tests in Settings: [EXTRA_TEST] is one of the TEST_ values. */
         const val ACTION_TEST = "io.github.pablocollantes.releasethebee.TEST"
         const val EXTRA_TEST = "test"

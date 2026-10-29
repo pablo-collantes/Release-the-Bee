@@ -69,6 +69,20 @@ steady or on a mute/unmute. The stock app clamps it to 35–100, default 65.
 SetDeviceState values: `0` mute, `1` recording, `2` sleep (hardware VAD), `3` power
 off, `4` sleep (software VAD). Start audio with `06 C0 01`, stop it with `06 C0 00`.
 
+What the states do to the mic (a TDK T5838, tested 2026-10-29). The device-state event
+reports each one as `[state][codec]`, e.g. `04 01`:
+
+| State | Mic | Sends audio while in it | Recording started from it |
+|---|---|---|---|
+| `0` mute | clock stopped | no | starts with a click (a 4 ms pulse at about 0.12 s, −23 dBFS) |
+| `2` sleep, hardware VAD | wake-on-sound, clock stopped | **yes**: woke itself (event `01 01`) after 4 s of room noise and streamed | clicks too |
+| `4` sleep, software VAD | running | no, over 20 s of a quiet room | no click |
+
+The click is the mic starting up: the datasheet gives 6 ms to settle and a DC offset
+of 3% of full scale. A blink made with `0`/`1` clicks again when it unmutes. The app
+mutes into `4` (Settings → "Keep the mic on while muted"); the RTB's own button still
+mutes into `0`, so the app moves it to `4` right after. Pause uses `0`. Never send `3`.
+
 ## Replies and events
 
 Notifications on the control characteristic start with a little-endian u16 tag:

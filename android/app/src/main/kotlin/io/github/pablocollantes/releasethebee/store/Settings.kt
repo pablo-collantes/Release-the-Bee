@@ -80,6 +80,14 @@ class Settings(ctx: Context) {
         get() = p.getInt("command_max_s", 30)
         set(v) = p.edit().putInt("command_max_s", v).apply()
 
+    /**
+     * Muted keeps the RTB's mic running (its software-VAD sleep) instead of stopping it, so
+     * recordings don't start with a click. Costs some battery; pause still stops the mic.
+     */
+    var warmMute: Boolean
+        get() = p.getBoolean("warm_mute", true)
+        set(v) = p.edit().putBoolean("warm_mute", v).apply()
+
     fun recorderConfig() = Recorder.Config(unmuteKind, doublePress, hold, commandMaxSeconds * 1000L)
 
     // ---------------------------------------------------------------- command feedback

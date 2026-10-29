@@ -83,7 +83,7 @@ token. Wrong or missing token → `401`.
 | `GET /api/entries` | `{"entries": [ … ], "deleted": [], "now": <ms>}`, newest first, with `transcript` and `summary` set to `null`. `command` is kept for commands (it's small) and `null` otherwise |
 | `GET /api/entries?since=<ms>` | only entries changed at or after `<ms>` (server clock), for cheap refreshes. `deleted` lists the ids deleted at or after `<ms>` |
 | `GET /api/entries/<id>` | the full entry, `404` if unknown |
-| `GET /api/entries/<id>/audio` | the recording as `audio/mp4` (AAC remuxed into M4A, so players can seek). Supports `Range` |
+| `GET /api/entries/<id>/audio` | the recording as `audio/mp4`, made to listen to: the mic's start-up clicks removed and boosted to a normal level (the RTB records quietly), at the recording's own bitrate (16–32 kbps). The raw `.aac` stays as it came. Supports `Range` |
 | `POST /api/entries/<id>/reprocess` | queue it again (after changing models). `202`, or `409` while it's still recording |
 | `PATCH /api/entries/<id>` | change a processed command (see below). `200` with the full entry |
 | `DELETE /api/entries/<id>` | delete the entry and its audio. `200` `{"id": "<id>", "deleted": true}`, also if it was already deleted. `404` if unknown |

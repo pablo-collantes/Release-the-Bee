@@ -3,7 +3,8 @@
 rtb_process.py: turn one finished recording into a transcript, speakers, and a summary
 or a command. docs/SERVER_API.md describes the result.
 
-    .aac ─ ffmpeg ─▶ 16 kHz mono, high-pass 80 Hz ─ diarization ─▶ who speaks when
+    .aac ─ ffmpeg ─▶ 16 kHz mono, high-pass 80 Hz ─ clicks removed ─┬─ boosted ─▶ .m4a to play
+                                                                  ├─ diarization ─▶ who speaks when
          ─ normalize, keep only speech ─ whisper ─▶ segments with S1, S2…
          ─ LLM ─▶ summary | command
 
@@ -20,15 +21,18 @@ Try it on one file (prints the result as JSON):
       --llm-url http://127.0.0.1:8742/v1
 """
 import argparse
+import array
 import bisect
 import datetime
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import statistics
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +44,23 @@ CLEAN_FILTER = "highpass=f=80"
 # dynaudnorm evens out loudness over ~15 s windows, so quiet speakers reach the same
 # level as the wearer. Applied to what whisper hears, not to what diarization hears.
 NORMALIZE_FILTER = "dynaudnorm=f=500:g=31:p=0.9:m=20"
+# The RTB's mic clicks each time its clock starts: a 4 ms pulse ~0.12 s into a recording,
+# and again after a command's blink. The RTB records far quieter than it used to (speech
+# around -68 dBFS), so the copy to play back is boosted: a fixed gain that brings the
+# loud end of the speech to PLAYBACK_LEVEL, then dynaudnorm lifts quieter stretches a
+# little (not silence: frames under t aren't touched), and a limiter catches the rest.
+CLICK_WIN = 32                  # samples: 2 ms
+CLICK_FLOOR = 30                # a click peaks over this (-60.8 dBFS)...
+CLICK_LOUD = 300                # (under -40.8 dBFS, the audio must also drop back right after:
+                                # a word starting after silence doesn't, a tap does)
+CLICK_OVER_BG = 15.85           # ...24 dB over the median peak within 250 ms...
+CLICK_OVER_AFTER = 3.98         # ...and 12 dB over what follows 6 to 16 ms later
+CLICK_EDGE = 2.0                # its edges: windows still 6 dB over that median...
+CLICK_REACH = (20, 20)          # ...at most this many windows before and after it
+PLAYBACK_LEVEL = -20.0          # dBFS RMS the 95th-percentile 100 ms window is brought to
+PLAYBACK_MAX_GAIN = 50.0
+PLAYBACK_FILTER = "volume={gain:.1f}dB,dynaudnorm=f=500:g=15:p=0.7:m=4:t=0.02,alimiter=limit=0.9:level=false"
+PLAYBACK_KBPS = (16, 32)        # the recording's own bitrate, within these (8 kbps twice over is rough)
 CHUNK_S = 600                   # whisper request size: the server is shared, keep turns short
 PAD_S = 1.0                     # audio kept after each speech turn...
 PRE_PAD_S = 2.0                 # ...and before it, so whisper hears how a sentence starts
@@ -147,6 +168,91 @@ def remux(args, aac, m4a):
     """ADTS → MP4 container without re-encoding, so players can seek."""
     tmp = m4a + ".tmp"
     ffmpeg(args, "-i", aac, "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp)
+    os.replace(tmp, m4a)
+
+
+def find_clicks(pcm):
+    """Clicks in 16 kHz PCM, as (start, end) sample ranges: a 2 ms window far louder than
+    the audio around it that dies away at once. Speech doesn't do that; a tap on the
+    RTB does, and goes too. Tested on every recording from 10-28 and 10-29: it finds
+    each start and blink click, with no hits on speech in recordings made since. The
+    range runs out to where the audio is back near its surroundings: the high-pass leaves
+    a tail after it, and AAC smears it up to ~30 ms ahead, with gaps (pre-echo), so the
+    start is the earliest loud window within reach."""
+    w = CLICK_WIN
+    n = len(pcm) // w
+    pk = [0] * n
+    for i in range(n):
+        part = pcm[i * w:(i + 1) * w]
+        pk[i] = max(max(part), -min(part))
+    found = []
+    for i in range(n):
+        p = pk[i]
+        if p < CLICK_FLOOR or i + 8 >= n or p < CLICK_OVER_AFTER * max(pk[i + 3:i + 8]):
+            continue
+        if found and i < found[-1][1] + 5:                  # one click, not its tail
+            continue
+        around = pk[max(0, i - 125):max(0, i - 5)] + pk[i + 6:i + 125]
+        bg = max(1, statistics.median(around))
+        if p >= CLICK_OVER_BG * bg and (p >= CLICK_LOUD or statistics.median(pk[i + 10:i + 40] or [0]) <= bg):
+            a = next((j for j in range(max(0, i - CLICK_REACH[0]), i) if pk[j] > CLICK_EDGE * bg), i)
+            b = i + 1
+            while b < min(n, i + 1 + CLICK_REACH[1]) and pk[b] > CLICK_EDGE * bg:
+                b += 1
+            found.append((a, b, i))
+    return [(max(0, a - 1) * w, min(n, b + 1) * w, i * w) for a, b, i in found]
+
+
+def declick(pcm):
+    """Bridge each click with a straight line from the audio before it to the audio after.
+    Returns the clicks' times in seconds (their loudest 2 ms)."""
+    clicks = find_clicks(pcm)
+    w = CLICK_WIN
+    for a, b, _ in clicks:
+        before, after = pcm[max(0, a - w):a], pcm[b:b + w]
+        m0 = sum(before) / len(before) if before else 0
+        m1 = sum(after) / len(after) if after else m0
+        for k in range(a, b):
+            pcm[k] = int(m0 + (m1 - m0) * (k - a) / (b - a))
+    return [round(c / RATE, 2) for _, _, c in clicks]
+
+
+def playback_gain(pcm):
+    """dB that brings the loud end of the speech to PLAYBACK_LEVEL. Never cuts."""
+    win = RATE // 10
+    levels = sorted(math.sqrt(sum(x * x for x in pcm[i:i + win:4]) / (win // 4))
+                    for i in range(0, len(pcm) - win, win))
+    if not levels:
+        return 0.0
+    loud = levels[int(len(levels) * 0.95)]
+    return max(0.0, min(PLAYBACK_MAX_GAIN, PLAYBACK_LEVEL - 20 * math.log10(max(loud, 1) / 32768)))
+
+
+def clean_audio(args, aac, wav):
+    """The recording as 16 kHz mono, high-passed, clicks removed. Returns its playback
+    gain in dB and the click times."""
+    ffmpeg(args, "-i", aac, "-af", CLEAN_FILTER, "-ar", str(RATE), "-ac", "1", "-c:a", "pcm_s16le", wav)
+    pcm = array.array("h")
+    pcm.frombytes(read_wav(wav))
+    clicks = declick(pcm)
+    if clicks:
+        write_wav(wav, pcm.tobytes())
+    return playback_gain(pcm), clicks
+
+
+def playback_kbps(aac):
+    """The recording's bitrate rounded up to 8 kbps, within PLAYBACK_KBPS: the copy to
+    play costs about what the recording did."""
+    seconds = adts_duration(aac)
+    kbps = os.path.getsize(aac) * 8 / 1000 / seconds if seconds else PLAYBACK_KBPS[1]
+    return max(PLAYBACK_KBPS[0], min(PLAYBACK_KBPS[1], 8 * math.ceil(kbps / 8)))
+
+
+def playback(args, clean_wav, gain, kbps, m4a):
+    """The copy to play: [clean_wav] boosted, as AAC in MP4."""
+    tmp = m4a + ".tmp"
+    ffmpeg(args, "-i", clean_wav, "-af", PLAYBACK_FILTER.format(gain=gain), "-c:a", "aac",
+           "-b:a", f"{kbps}k", "-movflags", "+faststart", "-f", "mp4", tmp)
     os.replace(tmp, m4a)
 
 
@@ -891,6 +997,21 @@ def preview_of(markdown):
 
 # --------------------------------------------------------------------------- the pipeline
 
+def build_playback(args, aac, clean, m4a, timings=None):
+    """Write [clean] (what whisper and diarization hear) and [m4a] (what the app plays).
+    If boosting fails, the app plays the recording as it came."""
+    t = time.time()
+    gain, clicks = clean_audio(args, aac, clean)
+    try:
+        playback(args, clean, gain, playback_kbps(aac), m4a)
+    except RuntimeError as e:
+        log(f"boosting failed, keeping the audio as recorded: {e}")
+        remux(args, aac, m4a)
+    log(f"playback: {len(clicks)} clicks removed {clicks[:6]}, +{gain:.1f} dB")
+    if timings is not None:
+        timings["playback"] = round(time.time() - t, 1)
+
+
 def process(args, aac, entry, save, check=lambda: None, notes=(), words=()):
     """Process one recording. save(**fields) stores results and status as each step
     finishes, so a failure later on keeps what was done; check() is called between
@@ -904,16 +1025,15 @@ def process(args, aac, entry, save, check=lambda: None, notes=(), words=()):
     # Commands are short and deliberate: whisper hears all of it, undiarized.
     diarize = have["whisper"] and have["diarize"] and entry.get("kind") != "command"
     save(status="diarizing" if diarize else "transcribing", error=None)
-    if have["ffmpeg"]:
-        remux(args, aac, stem + ".m4a")
     duration = adts_duration(aac)
     segments, language, speakers = [], None, None
     tmp = tempfile.mkdtemp(prefix="rtb-")
     try:
+        clean = os.path.join(tmp, "clean.wav")
+        if have["ffmpeg"]:
+            build_playback(args, aac, clean, stem + ".m4a", timings)
         if have["whisper"]:
-            clean = os.path.join(tmp, "clean.wav")
             norm = os.path.join(tmp, "norm.wav")
-            ffmpeg(args, "-i", aac, "-af", CLEAN_FILTER, "-ar", str(RATE), "-ac", "1", "-c:a", "pcm_s16le", clean)
             ffmpeg(args, "-i", clean, "-af", NORMALIZE_FILTER, "-c:a", "pcm_s16le", norm)
             total = os.path.getsize(clean) / (2 * RATE)
             timings["prepare"] = round(time.time() - t0, 1)
@@ -980,8 +1100,17 @@ def main():
     ap.add_argument("aac", help="a recording (.aac)")
     ap.add_argument("--kind", choices=["summary", "command"], default="summary")
     ap.add_argument("--started-at", type=int, help="ms since epoch (default: file time)")
+    ap.add_argument("--playback-only", action="store_true",
+                    help="only rebuild the .m4a the app plays (clicks removed, boosted)")
     add_arguments(ap)
     args = ap.parse_args()
+    if args.playback_only:
+        tmp = tempfile.mkdtemp(prefix="rtb-")
+        try:
+            build_playback(args, args.aac, os.path.join(tmp, "clean.wav"), args.aac[:-4] + ".m4a")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return
     started = args.started_at or int(os.path.getmtime(args.aac) * 1000)
     log(f"tools: {tools(args)}")
     result = {}

@@ -204,6 +204,53 @@ class CommandPromptTest(unittest.TestCase):
         self.assertEqual(system, self.command([])[0])
 
 
+class PlaybackTest(unittest.TestCase):
+    @staticmethod
+    def speech(seconds, amp=60):
+        """A quiet 150 Hz tone standing in for speech, at the RTB's current level."""
+        import array
+        import math
+        return array.array("h", (int(amp * math.sin(2 * math.pi * 150 * i / p.RATE)) for i in range(int(seconds * p.RATE))))
+
+    def click(self, pcm, at_s, height=-2400):
+        """The RTB's mic starting: a 4 ms one-sided pulse."""
+        i = int(at_s * p.RATE)
+        for k in range(i, i + 64):
+            pcm[k] = height
+
+    def test_finds_and_removes_the_start_and_blink_clicks(self):
+        pcm = self.speech(2)
+        self.click(pcm, 0.12)
+        self.click(pcm, 0.83)
+        self.assertEqual(p.declick(pcm), [0.12, 0.83])
+        self.assertLess(max(abs(x) for x in pcm), 100)
+
+    def test_leaves_speech_alone(self):
+        pcm = self.speech(2, amp=3000)                   # loud, but steady: not a click
+        before = pcm.tobytes()
+        self.assertEqual(p.declick(pcm), [])
+        self.assertEqual(pcm.tobytes(), before)
+
+    def test_a_quiet_tap_in_silence_goes(self):
+        pcm = self.speech(2, amp=2)
+        self.click(pcm, 1.0, height=-200)               # -44 dBFS: under the loud-click floor
+        self.assertEqual(p.declick(pcm), [1.0])
+
+    def test_a_word_starting_after_silence_stays(self):
+        pcm = self.speech(1, amp=0) + self.speech(3, amp=60)
+        self.click(pcm, 1.0, height=250)                # its first burst (-42 dBFS), then it carries on
+        before = pcm.tobytes()
+        self.assertEqual(p.declick(pcm), [])
+        self.assertEqual(pcm.tobytes(), before)
+
+    def test_gain_brings_speech_up_but_never_cuts(self):
+        quiet = self.speech(3, amp=12)                  # about -71 dBFS RMS
+        self.assertAlmostEqual(p.playback_gain(quiet), p.PLAYBACK_MAX_GAIN)
+        self.assertAlmostEqual(p.playback_gain(self.speech(3, amp=400)), p.PLAYBACK_LEVEL + 41.3, delta=0.5)
+        self.assertEqual(p.playback_gain(self.speech(3, amp=30000)), 0.0)
+        self.assertEqual(p.playback_gain(self.speech(0.05)), 0.0)
+
+
 class WordsTest(unittest.TestCase):
     def test_clean_words(self):
         self.assertEqual(p.clean_words([" Jev", "jev", 3, "", "x" * 41, "Release\nthe  Bee"]), ["Jev", "Release the Bee"])

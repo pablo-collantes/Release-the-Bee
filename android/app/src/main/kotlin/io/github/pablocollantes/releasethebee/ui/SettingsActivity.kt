@@ -644,6 +644,14 @@ class SettingsActivity : Activity() {
                 "From a muted RTB, a double press or hold unmutes it for the recording and mutes it after. " +
                 "A triple press counts as a double press. Five presses reset the RTB.",
         ))
+        root.addView(check("Keep the mic on while muted", settings.warmMute) {
+            settings.warmMute = it
+            if (AppStatus.snapshot.serviceRunning) RtbService.send(this, RtbService.ACTION_WARM_MUTE)
+        }, full(top = 8))
+        root.addView(note(
+            "Muted, the RTB sends nothing either way. With the mic off, every recording starts with a loud " +
+                "click as it powers up; kept on, there's no click, for some battery. Pause always turns it off.",
+        ).apply { setPadding(ui.dp(32), 0, 0, 0) })
     }
 
     private fun buildFeedbackSection(root: LinearLayout) {

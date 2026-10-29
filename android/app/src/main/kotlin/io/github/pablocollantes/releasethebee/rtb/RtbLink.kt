@@ -56,6 +56,7 @@ class RtbLink(
     private val knownAddressType: Int,
     private val listener: Listener,
     recordOnConnect: Boolean = true,
+    warmMute: Boolean = false,
 ) {
     enum class State { STOPPED, SCANNING, CONNECTING, HANDSHAKE, SEALING, STREAMING, PAUSED, MUTED, WAITING, FAILED }
 
@@ -96,6 +97,7 @@ class RtbLink(
     private var running = false
     private var paused = false
     private var wantRecording = recordOnConnect     // the RTB's resting state: its button, or ours
+    private var warmMute = warmMute                  // muted = its mic kept running (see [restState])
     private var borrowed = false                     // recording just for a command; forgotten with the link
     private var settleUntil = 0L                     // state events before this follow our own change
     private var blinking = false                     // our own mute/unmute flicker: ignore its state events
@@ -106,6 +108,7 @@ class RtbLink(
     private var holdEndedAt = 0L                     // its button let go of: the RTB mutes itself
     private var batteryAsked = false                 // once per connection; it reports changes itself
     private var stateTests = 0                       // sleep requests awaiting their reply
+    private var idleFrames = 0                       // audio that arrived while we weren't recording
     private var gatt: BluetoothGatt? = null
     private var control: BluetoothGattCharacteristic? = null
     private var scanCb: ScanCallback? = null
@@ -149,6 +152,13 @@ class RtbLink(
         }
     }
 
+    /** Muted in [RtbProtocol.STATE_SLEEP_SW_VAD] (the mic kept running) or in mute proper. */
+    fun setWarmMute(on: Boolean) = post {
+        if (warmMute == on) return@post
+        warmMute = on
+        if (gatt != null && control != null && step == null && !blinking && !wanted) muteNow()
+    }
+
     /** Paused = stay connected and sealed, but keep the RTB muted. Survives reconnects. */
     fun setPaused(p: Boolean) = post {
         if (paused == p) return@post
@@ -186,8 +196,8 @@ class RtbLink(
      */
     fun blink(offMs: Long, times: Int) = post {
         if (gatt == null || control == null || step != null || blinking) return@post reply("blink not sent: the RTB isn't connected or is busy")
-        val flip = if (streaming) RtbProtocol.STATE_MUTE else RtbProtocol.STATE_RECORDING
-        val back = if (streaming) RtbProtocol.STATE_RECORDING else RtbProtocol.STATE_MUTE
+        val flip = if (streaming) restState else RtbProtocol.STATE_RECORDING
+        val back = if (streaming) RtbProtocol.STATE_RECORDING else restState
         val n = times.coerceIn(1, 5)
         blinking = true
         blinkSeen = 0
@@ -380,6 +390,7 @@ class RtbLink(
 
     private fun teardown(reason: String) {
         endStream(reason)
+        reportIdleFrames()
         borrowed = false                // a command ends with the link
         blinkGen++
         blinking = false
@@ -615,19 +626,26 @@ class RtbLink(
             RtbProtocol.TAG_EVENT_CHARGING -> return e.payload.firstOrNull()?.let { listener.onBattery(null, it.toInt() != 0) } ?: Unit
         }
         if (e.tag != RtbProtocol.TAG_EVENT_DEVICE_STATE || e.payload.isEmpty()) return
-        val recording = e.payload[0].toInt() == RtbProtocol.STATE_RECORDING
+        reportIdleFrames()
+        val state = e.payload[0].toInt()
+        val recording = state == RtbProtocol.STATE_RECORDING
         if (blinking) {
             blinkSeen++
             blinkLast = recording
             return
         }
         if (gatt == null || step != null || paused) return     // our own handshake or pause caused it
-        deviceState(recording)
+        deviceState(recording, state)
     }
 
-    private fun deviceState(recording: Boolean) {
-        if (recording == wanted && recording == streaming) return         // what we asked for
+    /** [state]: the RTB's own number for it; null = not said (a blink's last event). */
+    private fun deviceState(recording: Boolean, state: Int? = null) {
         val now = SystemClock.elapsedRealtime()
+        if (recording == wanted && recording == streaming) {           // what we asked for...
+            // ...except that its button mutes it properly: keep the mic warm instead.
+            if (!recording && state != null && state != restState && now >= settleUntil) muteNow()
+            return
+        }
         if (recording && now - holdStartedAt < STATE_SETTLE_MS) {
             // The RTB unmutes itself when a hold registers. That isn't its single press, so
             // not a new resting state: what the hold means is the Recorder's call, and it
@@ -642,7 +660,7 @@ class RtbLink(
             holdEndedAt = 0
             if (wantRecording) return record()
             endStream("button let go")
-            return settledMuted()
+            return rest(state)
         }
         if (now < settleUntil) {
             // Right after we set the state: the RTB settling, not its button. Ours stands.
@@ -654,6 +672,7 @@ class RtbLink(
         if (!recording && streaming) {
             endStream("RTB stopped recording")
             setState(State.MUTED, "the RTB stopped recording (its button?); waiting for it to resume")
+            if (state != null && state != restState) muteNow()
         } else if (recording && !streaming) {
             if (decryptor != null) beginStream() else send(Step.NONCE, RtbProtocol.getSessionNonce())
         }
@@ -687,11 +706,7 @@ class RtbLink(
         val want = wanted
         when {
             want && !streaming -> record()
-            !want && streaming -> {
-                endStream(if (paused) "paused" else "muted from the app")
-                muteNow()
-            }
-            !want -> settledMuted()
+            !want -> muteNow()             // also when muted already: pause changes what muted means
         }
     }
 
@@ -705,8 +720,18 @@ class RtbLink(
     private fun muteNow() {
         if (paused) decryptor = null
         endStream(if (paused) "paused" else "muted from the app")
-        send(Step.MUTE, RtbProtocol.setDeviceState(RtbProtocol.STATE_MUTE))
+        send(Step.MUTE, RtbProtocol.setDeviceState(restState))
     }
+
+    /**
+     * What muted means. Mute proper stops the mic's clock, and the mic clicks loudly when
+     * it starts again (docs/RTB_PROTOCOL.md). The software-VAD sleep keeps the mic running
+     * and sends nothing (tested in a quiet room), for more battery. Paused uses mute proper.
+     */
+    private val restState get() = if (warmMute && !paused) RtbProtocol.STATE_SLEEP_SW_VAD else RtbProtocol.STATE_MUTE
+
+    /** The RTB muted itself into [state]: keep it there, or move it to [restState]. */
+    private fun rest(state: Int?) = if (state != null && state != restState) muteNow() else settledMuted()
 
     private fun settle() {
         settleUntil = SystemClock.elapsedRealtime() + STATE_SETTLE_MS
@@ -779,9 +804,17 @@ class RtbLink(
         if (streaming) return
         streaming = true
         attempts = 0
+        reportIdleFrames()
         setState(State.STREAMING, "streaming from RTB $deviceHex")
         listener.onStreamStart(deviceHex)
         askBattery()
+    }
+
+    /** The sleep states may send audio on their own: say how much came. */
+    private fun reportIdleFrames() {
+        if (idleFrames == 0) return
+        log("$idleFrames audio frames (${idleFrames * RtbProtocol.AUDIO_FRAME_LEN / 1024} KB) arrived while not recording")
+        idleFrames = 0
     }
 
     private fun endStream(reason: String) {
@@ -798,6 +831,7 @@ class RtbLink(
                 settle()
                 beginStream()
             } else {
+                if (idleFrames++ == 0) log("audio arriving while not recording")
                 return
             }
         }

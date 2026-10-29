@@ -28,6 +28,7 @@ We call the device the **RTB** (as in *Release the Bee*).
 | Local transcription, speakers, summaries and voice commands | **New.** Works on real recordings (whisper.cpp, sherpa-onnx, Gemma 4 E4B) |
 | Notes, reminders that ring, deleting recordings | **New in 0.4.** Unit-tested; hardware testing in progress |
 | RTB battery level, a word list for names whisper mishears | **New in 0.4.1.** Battery read from a real RTB |
+| No start-up click: the mic stays on while muted; quiet recordings boosted for playback | **New in 0.4.3.** Tested on a real RTB; the light while muted still to check |
 | Cloudflare relay, spill-to-disk buffering, extracting the token inside the app | Planned |
 
 ## Quick start
@@ -97,7 +98,7 @@ finishes with what it has.
 
 | Step | Needs | Flags |
 |---|---|---|
-| Seekable M4A, audio clean-up | `ffmpeg` | `--ffmpeg` (default: on `PATH`) |
+| Seekable M4A with clicks removed and the volume boosted, audio clean-up | `ffmpeg` | `--ffmpeg` (default: on `PATH`) |
 | Transcript | a [whisper.cpp](https://github.com/ggml-org/whisper.cpp) server, or `whisper-cli` | `--whisper-url`, or `--whisper-cli` + `--whisper-model`; `--language` |
 | Speakers, and skipping silence (where whisper invents text) | `sherpa-onnx` and its models | `--sherpa-dir`; `--speakers N` if you know it |
 | Summary (unmute) or command (double press, hold) | any OpenAI-compatible chat endpoint | `--llm-url`, `--llm-model`, `--llm-key`, `--llm-context`, `--llm-chunk` |
