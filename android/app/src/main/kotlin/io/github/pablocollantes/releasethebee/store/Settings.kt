@@ -93,10 +93,17 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("feedback_blink", false)
         set(v) = p.edit().putBoolean("feedback_blink", v).apply()
 
-    /** How long one blink keeps the LED off (or on). */
+    /**
+     * How long one blink keeps the LED off (or on). One of [BLINK_LENGTHS]: shorter blinks
+     * (0.4 and before offered 0.1 to 0.6 s) were often swallowed by the RTB.
+     */
     var blinkMs: Int
-        get() = p.getInt("blink_ms", 300)
+        get() = p.getInt("blink_ms", 1000).let { ms -> BLINK_LENGTHS.minBy { kotlin.math.abs(it - ms) } }
         set(v) = p.edit().putInt("blink_ms", v).apply()
+
+    companion object {
+        val BLINK_LENGTHS = listOf(500, 1000, 1500, 2000)
+    }
 
     private inline fun <reified E : Enum<E>> enumOr(key: String, default: E): E =
         runCatching { enumValueOf<E>(p.getString(key, null)!!) }.getOrDefault(default)

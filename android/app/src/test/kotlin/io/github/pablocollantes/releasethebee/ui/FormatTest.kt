@@ -36,6 +36,20 @@ class FormatTest {
         assertEquals("Fri 12 Dec 2025", fmt.day(at(2025, 12, 12, 12, 0), now))
     }
 
+    @Test fun `due times read naturally`() {
+        val now = at(2026, 10, 28, 20, 0)
+        assertEquals("Today 21:30", fmt.dayTime(at(2026, 10, 28, 21, 30), now))
+        assertEquals("Tomorrow 09:00", fmt.dayTime(at(2026, 10, 29, 9, 0), now))
+        assertEquals("Yesterday 18:07", fmt.dayTime(at(2026, 10, 27, 18, 7), now))
+        assertEquals("Saturday 15:00", fmt.dayTime(at(2026, 10, 31, 15, 0), now))
+        assertEquals("Wed 4 Nov, 15:00", fmt.dayTime(at(2026, 11, 4, 15, 0), now))
+    }
+
+    @Test fun `times for the receiver are ISO 8601 with the offset`() {
+        assertEquals("2026-10-29T15:00:00+01:00", fmt.iso(at(2026, 10, 29, 15, 0)))
+        assertEquals("2026-07-01T09:30:00+02:00", fmt.iso(at(2026, 7, 1, 9, 30)))
+    }
+
     @Test fun `durations`() {
         assertEquals("0:42", Format.clockDuration(42.9))
         assertEquals("12:04", Format.clockDuration(724.0))

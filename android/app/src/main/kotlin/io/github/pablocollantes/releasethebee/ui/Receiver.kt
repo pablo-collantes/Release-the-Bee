@@ -1,7 +1,6 @@
 package io.github.pablocollantes.releasethebee.ui
 
 import android.content.Context
-import io.github.pablocollantes.releasethebee.api.EntryIndex
 import io.github.pablocollantes.releasethebee.api.ReceiverApi
 import io.github.pablocollantes.releasethebee.store.SecretStore
 import io.github.pablocollantes.releasethebee.store.Settings
@@ -9,12 +8,6 @@ import java.io.IOException
 
 /** Where the screens get recordings from: the receiver behind the WebSocket destination. */
 object Receiver {
-
-    /** The list, kept for the life of the process so reopening the app only fetches changes. */
-    val index = EntryIndex()
-
-    /** Which receiver [index] came from. Another URL means a full fetch, not `?since=`. */
-    var indexOrigin: String? = null
 
     sealed interface Source {
         class Ready(val api: ReceiverApi) : Source

@@ -42,6 +42,7 @@ import rtb_process
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_MESSAGE = 1 << 20
+MAX_BODY = 1 << 16                           # HTTP request bodies (PATCH)
 AUDIO_HEADER = struct.Struct(">IQ")          # seq u32, captured_at_ms u64
 ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -146,14 +147,15 @@ async def ws_message(reader, writer):
 class Recorder:
     """Maps sessions to files and entries. A session the phone drops stays open for
     --finish-after seconds, so a reconnect (resumed=true) keeps appending to the same
-    file. When a session finishes, its entry is queued for processing."""
+    file. When a session finishes, its entry is queued for processing, or its files are
+    deleted if the entry was deleted meanwhile."""
 
     def __init__(self, out_dir, store, hook=None, finish_after=600):
         self.out = out_dir
         self.store = store
         self.hook = hook
         self.finish_after = finish_after
-        self.open_sessions = {}  # session id -> {"path", "parent", "last_at"}
+        self.open_sessions = {}  # session id -> {"path", "parent", "last_at", "deleted"}
         self.pending = {}        # session id -> TimerHandle that finishes it
 
     def is_open(self, session):
@@ -170,6 +172,9 @@ class Recorder:
         s = self.open_sessions.get(session)
         if s:
             return s["path"]
+        if self.store.is_deleted(session):               # resumed after the user deleted it
+            self.open_sessions[session] = {"path": os.devnull, "parent": parent, "last_at": None, "deleted": True}
+            return os.devnull
         meta = {"kind": kind, "trigger": trigger, "parent": parent}
         entry = self.store.get(session)
         if entry:                                        # resumed after we had finished it
@@ -192,7 +197,7 @@ class Recorder:
                 self.store.reopen(session, **meta)
             else:
                 self.store.create(rtb_entries.new_entry(session, device, started_at=started_at_ms, **meta), stem)
-        self.open_sessions[session] = {"path": stem + ".aac", "parent": parent, "last_at": None}
+        self.open_sessions[session] = {"path": stem + ".aac", "parent": parent, "last_at": None, "deleted": False}
         return stem + ".aac"
 
     @staticmethod
@@ -204,8 +209,17 @@ class Recorder:
         """At startup: an entry whose file was still growing. Wait for the phone to resume
         it like any dropped session."""
         stem = self.store.stems[entry_id]
-        self.open_sessions[entry_id] = {"path": stem + ".aac", "parent": None, "last_at": None}
+        self.open_sessions[entry_id] = {"path": stem + ".aac", "parent": None, "last_at": None, "deleted": False}
         self.dropped(entry_id)
+
+    def delete(self, session):
+        """Delete an entry. If its session is still open, audio may keep arriving: the
+        entry goes now, its files when the session finishes. Returns False if unknown."""
+        s = self.open_sessions.get(session)
+        if s is None:
+            return self.store.delete(session)
+        s["deleted"] = True
+        return self.store.delete(session, keep_files=True)
 
     def touch(self, session, captured_at_ms):
         s = self.open_sessions.get(session)
@@ -226,6 +240,11 @@ class Recorder:
         if s is None:
             return
         path = s["path"]
+        if s["deleted"] or self.store.is_deleted(session):
+            log(f"session finished ({reason}), deleted: {path}")
+            if path != os.devnull:
+                rtb_entries.remove_files(path[:-4])
+            return
         size = os.path.getsize(path) if os.path.exists(path) else 0
         log(f"session finished ({reason}): {path} ({size / 1024:.0f} KiB)")
         duration = rtb_process.adts_duration(path) if size else 0.0
@@ -310,6 +329,8 @@ class Stream:
         if self.f:                                      # flush before the size check in finish()
             self.f.close()
             self.f = None
+        if msg.get("discard"):                          # the phone threw it away: delete it
+            self.rec.delete(session)
         self.rec.finish(session, msg.get("reason", "ended"))
         if not self.stack and parent and self.rec.is_open(parent):
             # The command ended; its summary is still open (maybe from before a reconnect).
@@ -363,17 +384,20 @@ def json_response(status, obj):
 
 
 REASONS = {200: "OK", 202: "Accepted", 206: "Partial Content", 400: "Bad Request", 401: "Unauthorized",
-           404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 416: "Range Not Satisfiable",
-           426: "Upgrade Required", 500: "Internal Server Error"}
+           404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 413: "Content Too Large",
+           416: "Range Not Satisfiable", 426: "Upgrade Required", 500: "Internal Server Error"}
 
 
-def route(method, target, headers, store, token):
+def route(method, target, headers, store, token, body=b"", rec=None):
     """Answer one plain HTTP request (docs/SERVER_API.md). Pure: no sockets, so tests
-    can call it directly."""
+    can call it directly. rec is the Recorder, so a delete knows which sessions are
+    still open (without it, the files go right away)."""
     if not authorized(headers, token):
         r = json_response(401, {"error": "unauthorized"})
         r.headers["WWW-Authenticate"] = "Bearer"
         return r
+    if len(body) > MAX_BODY:
+        return json_response(413, {"error": "body over 64 KiB"})
     url = urllib.parse.urlsplit(target)
     parts = [p for p in url.path.split("/") if p]
     if not parts:
@@ -390,13 +414,30 @@ def route(method, target, headers, store, token):
                 since = int(query["since"][0])
             except ValueError:
                 return json_response(400, {"error": "since must be ms since epoch"})
-        now = rtb_entries.now_ms()
-        return json_response(200, {"entries": store.list(since), "now": now})
+        now = rtb_entries.now_ms()          # before reading: a change made meanwhile is sent twice, not missed
+        return json_response(200, {"entries": store.list(since), "deleted": store.deleted_since(since), "now": now})
     id = urllib.parse.unquote(parts[2])
     entry = store.get(id) if ID.match(id) else None
     if entry is None:
+        if len(parts) == 3 and method == "DELETE" and store.is_deleted(id):
+            return json_response(200, {"id": id, "deleted": True})
         return json_response(404, {"error": "no such entry"})
     if len(parts) == 3:
+        if method == "PATCH":
+            try:
+                changes = command_changes(body)
+            except ValueError as e:
+                return json_response(400, {"error": str(e)})
+            entry = store.edit_command(id, changes)
+            if entry is None:
+                return json_response(409, {"error": "not a processed command"})
+            return json_response(200, entry)
+        if method == "DELETE":
+            if rec:
+                rec.delete(id)
+            else:
+                store.delete(id)
+            return json_response(200, {"id": id, "deleted": True})
         if method not in ("GET", "HEAD"):
             return json_response(405, {"error": "method not allowed"})
         return json_response(200, entry)
@@ -414,6 +455,41 @@ def route(method, target, headers, store, token):
             return json_response(409, {"error": "still recording"})
         return json_response(202, {"id": id, "status": "queued"})
     return json_response(404, {"error": "not found"})
+
+
+def command_changes(body):
+    """The command fields a PATCH body changes. Unknown keys are ignored; anything
+    malformed raises ValueError with the message for the 400."""
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        raise ValueError("body must be JSON") from None
+    cmd = obj.get("command") if isinstance(obj, dict) else None
+    if not isinstance(cmd, dict):
+        raise ValueError('body must be {"command": {…}}')
+    changes = {}
+    for k, v in cmd.items():
+        if k == "done" and not isinstance(v, bool):
+            raise ValueError("done must be true or false")
+        if k == "text" and not isinstance(v, str):
+            raise ValueError("text must be a string")
+        if k == "note" and not (v is None or isinstance(v, str)):
+            raise ValueError("note must be a string or null")
+        if k == "when" and not (v is None or iso_with_offset(v)):
+            raise ValueError("when must be ISO 8601 with an offset, or null")
+        if k in ("done", "text", "note", "when"):
+            changes[k] = v
+    return changes
+
+
+def iso_with_offset(v):
+    if not isinstance(v, str):
+        return False
+    try:
+        t = datetime.datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith(("Z", "z")) else v)
+    except ValueError:
+        return False
+    return t.tzinfo is not None
 
 
 def file_response(path, mime, range_header):
@@ -494,10 +570,11 @@ async def handle_conn(reader, writer, hub):
     try:
         if not is_ws:
             length = headers.get("content-length", "0")
-            if length.isdigit() and 0 < int(length) <= 65536:
-                await reader.readexactly(int(length))                    # a POST body we don't need
+            # One byte past the limit is enough for route() to answer 413.
+            n = min(int(length), MAX_BODY + 1) if length.isdigit() else 0
+            body = await asyncio.wait_for(reader.readexactly(n), 10) if n else b""
             try:
-                r = route(method, target, headers, hub.store, hub.args.token)
+                r = route(method, target, headers, hub.store, hub.args.token, body, hub.rec)
             except Exception as e:                                       # a bug: say so, don't hang up
                 log(f"{peer}: {method} {target} failed: {e!r}")
                 r = json_response(500, {"error": "internal error"})
@@ -512,7 +589,7 @@ async def handle_conn(reader, writer, hub):
             is_ws = False                                   # so the finally below closes it
             return
         await ws_accept(writer, headers)
-    except (asyncio.IncompleteReadError, ConnectionError):
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
         is_ws = False
         return
     finally:

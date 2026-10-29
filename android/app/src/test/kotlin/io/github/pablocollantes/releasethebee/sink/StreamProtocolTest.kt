@@ -29,6 +29,10 @@ class StreamProtocolTest {
             """{"type":"session_end","session":"abc","reason":"link \"lost\"\n"}""",
             StreamProtocol.sessionEnd(s, "link \"lost\"\n"),
         )
+        assertEquals(
+            """{"type":"session_end","session":"abc","reason":"deleted","discard":true}""",
+            StreamProtocol.sessionEnd(s, "deleted", discard = true),
+        )
     }
 
     @Test fun `session_start carries kind, trigger and parent for a nested command`() {

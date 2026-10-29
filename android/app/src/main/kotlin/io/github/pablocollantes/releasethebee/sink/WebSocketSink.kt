@@ -78,7 +78,7 @@ class WebSocketSink(
         val w = ws ?: throw IOException("not connected")
         when (item) {
             is Item.Start -> sendText(StreamProtocol.sessionStart(item.s, resumed = false))
-            is Item.End -> sendText(StreamProtocol.sessionEnd(item.s, item.reason))
+            is Item.End -> sendText(StreamProtocol.sessionEnd(item.s, item.reason, item.discard))
             is Item.Audio -> if (!w.send(StreamProtocol.audio(item.f).toByteString())) throw IOException("connection closed")
         }
         // Keep OkHttp's own buffer short, so a silently dead link loses seconds of audio

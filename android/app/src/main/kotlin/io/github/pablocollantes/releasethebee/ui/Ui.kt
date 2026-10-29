@@ -18,6 +18,7 @@ import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -174,6 +175,33 @@ class Ui(private val ctx: Context) {
         letterSpacing = 0.06f
         background = rounded(bg, 6)
         setPadding(dp(7), dp(2), dp(7), dp(2))
+    }
+
+    /** A filter chip: filled when [on]. */
+    fun chip(label: String, on: Boolean, onClick: () -> Unit) = text(14f, if (on) onAccent else fg, bold = true, value = label).apply {
+        background = ripple(rounded(if (on) accent else 0, 18, if (on) null else divider))
+        setPadding(dp(14), dp(7), dp(14), dp(7))
+        isClickable = true
+        setOnClickListener { onClick() }
+    }
+
+    fun setChip(chip: TextView, on: Boolean) {
+        chip.setTextColor(if (on) onAccent else fg)
+        chip.background = ripple(rounded(if (on) accent else 0, 18, if (on) null else divider))
+    }
+
+    fun checkbox() = CheckBox(ctx).apply {
+        buttonTintList = ColorStateList.valueOf(accent)
+    }
+
+    /** A section title with an optional link at the end ("See all"). */
+    fun sectionRow(title: String, link: String? = null, onLink: (() -> Unit)? = null) = LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(0, dp(20), 0, dp(4))
+        addView(text(12f, fgMuted, bold = true, value = title.uppercase()).apply { letterSpacing = 0.08f },
+            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        if (link != null && onLink != null) addView(link(link, size = 13f) { onLink() })
     }
 
     fun card(color: Int = surface) = LinearLayout(ctx).apply {

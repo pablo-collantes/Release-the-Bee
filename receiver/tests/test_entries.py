@@ -4,10 +4,12 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import helpers  # noqa: F401  (puts receiver/ on the path)
 import rtb_entries
-from helpers import adts
+import rtb_process
+from helpers import Args, adts
 
 
 class EntryStoreTest(unittest.TestCase):
@@ -32,6 +34,20 @@ class EntryStoreTest(unittest.TestCase):
         t = time.time() - age_s
         os.utime(path, (t, t))
         return path
+
+    def command(self, s, id, started, note, action="ADD_TO_NOTE", status="done"):
+        """A command entry the worker has processed."""
+        s.create(rtb_entries.new_entry(id, "dev", kind="command", started_at=started), os.path.join(self.root, id))
+        s.update(id, status=status, command={"action": action, "note": note, "text": "x", "when": None, "model": "m"})
+
+    def queued(self, s, id, kind="command"):
+        """An entry with some audio, waiting for the worker."""
+        stem = os.path.join(self.root, id)
+        with open(stem + ".aac", "wb") as f:
+            f.write(adts(10))
+        s.create(rtb_entries.new_entry(id, "dev", kind=kind, started_at=1), stem)
+        s.update(id, status="queued")
+        return stem
 
     def test_create_update_persist(self):
         s = self.store()
@@ -107,6 +123,132 @@ class EntryStoreTest(unittest.TestCase):
         time.sleep(0.005)
         s.update("e1", status="failed", error="boom")
         self.assertEqual([e["id"] for e in s.list(since=mark)], ["e1"])
+
+    def test_list_keeps_command_bodies(self):
+        s = self.store()
+        self.command(s, "c", 2000, "Shopping list")
+        s.create(rtb_entries.new_entry("m", "dev", started_at=1000), os.path.join(self.root, "m"))
+        s.update("m", status="done", transcript={"segments": []}, summary={"title": "t"})
+        c, m = s.list()
+        self.assertEqual(c["command"]["note"], "Shopping list")
+        self.assertIs(c["command"]["done"], False)                      # new commands aren't done
+        self.assertIsNone(c["transcript"])
+        self.assertEqual((m["summary"], m["command"]), (None, None))
+
+    def test_done_survives_reprocess(self):
+        s = self.store()
+        self.queued(s, "c")
+        runs = []
+
+        def process(args, aac, entry, save, check, notes=()):
+            runs.append(entry["id"])
+            save(status="done", command={"action": "CREATE_NOTE", "note": f"Run {len(runs)}", "text": "x",
+                                         "when": None, "model": "m"})
+        worker = rtb_entries.Worker(s, Args())
+        with mock.patch.object(rtb_process, "process", process):
+            worker.handle(*s.next_job(timeout=0))
+            self.assertIs(s.get("c")["command"]["done"], False)
+            s.edit_command("c", {"done": True})
+            self.assertTrue(s.reprocess("c"))
+            worker.handle(*s.next_job(timeout=0))
+        cmd = s.get("c")["command"]
+        self.assertEqual((cmd["note"], cmd["done"]), ("Run 2", True))
+
+    def test_commands_saved_before_done_existed_load_as_not_done(self):
+        path = self.write_aac("dev/2026-10-28/090000_cccc3333.aac")
+        e = rtb_entries.new_entry("uuid-c", "dev", kind="command", started_at=1)
+        e["status"] = "done"
+        e["command"] = {"action": "UNKNOWN", "note": None, "text": "hm", "when": None, "model": "m"}
+        with open(path[:-4] + ".json", "w") as f:
+            json.dump(e, f)
+        self.assertIs(self.store().get("uuid-c")["command"]["done"], False)
+
+    def test_delete(self):
+        s = self.store()
+        stem = os.path.join(self.root, "dev", "2026-10-28", "101500_dddd0000")
+        os.makedirs(os.path.dirname(stem))
+        s.create(rtb_entries.new_entry("dddd0000-uuid", "dev", started_at=1), stem)
+        s.update("dddd0000-uuid", status="queued")
+        for ext in (".aac", ".m4a", ".json.tmp"):
+            open(stem + ext, "wb").close()
+        mark = rtb_entries.now_ms()
+        self.assertTrue(s.delete("dddd0000-uuid"))
+        self.assertEqual(os.listdir(os.path.dirname(stem)), [])
+        self.assertIsNone(s.get("dddd0000-uuid"))
+        self.assertIsNone(s.next_job(timeout=0))                          # not queued any more
+        self.assertEqual(self.changes[-1], {"id": "dddd0000-uuid", "kind": "summary", "status": "deleted",
+                                            "title": None})
+        self.assertEqual(s.deleted_since(mark), ["dddd0000-uuid"])
+        self.assertEqual(s.deleted_since(None), [])
+        self.assertFalse(s.delete("dddd0000-uuid"))
+
+        again = self.store()                                              # remembered across a restart
+        self.assertTrue(again.is_deleted("dddd0000-uuid"))
+        self.assertEqual(again.deleted_since(mark), ["dddd0000-uuid"])
+        self.assertEqual(again.entries, {})
+
+    def test_tombstones_on_load(self):
+        now = rtb_entries.now_ms()
+        with open(os.path.join(self.root, "deleted.json"), "w") as f:
+            json.dump({"ancient": now - 91 * 86400 * 1000, "older": now - 2000, "eeee4444-uuid": now - 1000}, f)
+        # Deleted while it was still being recorded, then the receiver restarted.
+        path = self.write_aac("dev/2026-10-28/090000_eeee4444.aac")
+        with open(path[:-4] + ".json", "w") as f:
+            json.dump(rtb_entries.new_entry("eeee4444-uuid", "dev", started_at=1), f)
+        s = self.store()
+        self.assertEqual(s.entries, {})
+        self.assertEqual(os.listdir(os.path.dirname(path)), [])
+        self.assertEqual(s.deleted_since(0), ["older", "eeee4444-uuid"])   # 90 days on, forgotten
+        with open(os.path.join(self.root, "deleted.json")) as f:
+            self.assertNotIn("ancient", json.load(f))
+
+    def test_delete_stops_the_worker_and_cleans_up_after_it(self):
+        s = self.store()
+        stem = self.queued(s, "w", kind="summary")
+        reached = []
+
+        def process(args, aac, entry, save, check, notes=()):
+            save(status="transcribing")
+            s.delete("w")                                       # the user deletes it mid-run...
+            with open(stem + ".m4a", "wb") as f:                # ...and then the remux lands
+                f.write(b"m4a")
+            self.assertRaises(rtb_process.Cancelled, check)
+            reached.append("check")
+            save(status="done")
+            reached.append("save")                              # never: save raises Cancelled
+        with mock.patch.object(rtb_process, "process", process):
+            rtb_entries.Worker(s, Args()).handle(*s.next_job(timeout=0))
+        self.assertEqual(reached, ["check"])
+        self.assertEqual(os.listdir(self.root), ["deleted.json"])
+        self.assertIsNone(s.get("w"))
+
+    def test_note_titles(self):
+        s = self.store()
+        self.command(s, "a", 1000, "Groceries", action="CREATE_NOTE")
+        self.command(s, "b", 3000, " groceries ")                         # the same note, more recent
+        self.command(s, "c", 2000, "Gift ideas")
+        self.command(s, "d", 4000, None, action="CREATE_REMINDER")
+        self.command(s, "e", 5000, "Half done", status="summarizing")      # not finished
+        self.assertEqual(s.note_titles(), ["groceries", "Gift ideas"])
+        for i in range(40):
+            self.command(s, f"n{i}", 10000 + i, f"Note {i}")
+        titles = s.note_titles()
+        self.assertEqual((len(titles), titles[0]), (30, "Note 39"))
+
+    def test_worker_gives_commands_the_note_titles(self):
+        s = self.store()
+        self.command(s, "old", 1000, "Groceries", action="CREATE_NOTE")
+        self.queued(s, "new")
+        self.queued(s, "talk", kind="summary")
+        seen = {}
+
+        def process(args, aac, entry, save, check, notes=()):
+            seen[entry["id"]] = notes
+        with mock.patch.object(rtb_process, "process", process):
+            worker = rtb_entries.Worker(s, Args())
+            worker.handle(*s.next_job(timeout=0))
+            worker.handle(*s.next_job(timeout=0))
+        self.assertEqual(seen, {"new": ["Groceries"], "talk": ()})
 
     def test_stale_worker_updates_are_dropped(self):
         s = self.store()

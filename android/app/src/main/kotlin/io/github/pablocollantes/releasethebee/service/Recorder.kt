@@ -21,6 +21,10 @@ import java.util.UUID
  * Commands end on the same gesture again (or a hold's release), or after
  * [Config.commandMaxMs]. Their start and end get [Output.commandFeedback].
  *
+ * Unmuting the RTB for a command is temporary: the RTB's resting state (muted or
+ * recording) is whatever its button or a summary last chose, and a dropped link mid-command
+ * goes back to it. [discard] stops a recording the user deleted while it ran.
+ *
  * Calls arrive from the link thread and from timers; everything is synchronized, so audio
  * never lands outside the session it belongs to.
  */
@@ -42,9 +46,13 @@ class Recorder(
     interface Output {
         fun sessionStart(s: SessionInfo)
         fun audio(f: AudioFrame)
-        fun sessionEnd(s: SessionInfo, reason: String)
-        /** Ask the RTB to record or mute. */
-        fun setRecording(on: Boolean)
+        /** [discard]: the user deleted it while it ran. */
+        fun sessionEnd(s: SessionInfo, reason: String, discard: Boolean)
+        /**
+         * Ask the RTB to record or mute. [temporary]: just for a command, so not its new
+         * resting state (see [io.github.pablocollantes.releasethebee.rtb.RtbLink.setRecording]).
+         */
+        fun setRecording(on: Boolean, temporary: Boolean)
         /** A command started or ended. [ledShows]: the RTB unmuted or muted for it, so its light already changed. */
         fun commandFeedback(start: Boolean, ledShows: Boolean)
         /** Run [f] after [ms]; returns a cancel. */
@@ -65,6 +73,9 @@ class Recorder(
 
     /** Where audio goes right now: the command inside a summary, or the outer recording. */
     val current: SessionInfo? @Synchronized get() = child ?: top
+
+    /** Ids of the recordings open now, outermost first. */
+    val live: List<String> @Synchronized get() = listOfNotNull(top?.id, child?.id)
 
     // ------------------------------------------------------------------ from the link
 
@@ -109,8 +120,9 @@ class Recorder(
                 when {
                     h != null -> end(h, "hold released")
                     pending?.hold == true -> {      // let go before the RTB started recording
+                        val p = pending!!
                         pending = null
-                        out.setRecording(false)
+                        out.setRecording(false, temporary = p.kind == Kind.COMMAND)
                     }
                 }
             }
@@ -146,7 +158,7 @@ class Recorder(
 
     private fun requestStart(kind: Kind, trigger: Trigger, hold: Boolean) {
         pending = Pending(kind, trigger, hold, clock())
-        out.setRecording(true)
+        out.setRecording(true, temporary = kind == Kind.COMMAND)
     }
 
     /** End [s]. A nested command hands the audio back to its summary; anything else mutes the RTB. */
@@ -156,8 +168,29 @@ class Recorder(
         } else if (s === top) {
             child?.let { close(it, reason, ledShows = true) }
             close(s, reason, ledShows = true)
-            out.setRecording(false)
+            out.setRecording(false, temporary = s.kind == Kind.COMMAND)
         }
+    }
+
+    /**
+     * The user deleted recording [id] while it ran: end it, and tell the sinks to throw it
+     * away. A command inside a summary hands the audio back to the summary. An outer
+     * recording also mutes the RTB; a command recorded inside it is kept. False if [id]
+     * isn't recording.
+     */
+    @Synchronized fun discard(id: String): Boolean {
+        val c = child
+        val t = top
+        when (id) {
+            c?.id -> close(c, "deleted", ledShows = false, discard = true)
+            t?.id -> {
+                c?.let { close(it, "its recording was deleted", ledShows = true) }
+                close(t, "deleted", ledShows = true, discard = true)
+                out.setRecording(false, temporary = t.kind == Kind.COMMAND)
+            }
+            else -> return false
+        }
+        return true
     }
 
     // ------------------------------------------------------------------ sessions
@@ -169,15 +202,15 @@ class Recorder(
         return s
     }
 
-    private fun close(s: SessionInfo, reason: String, ledShows: Boolean) {
+    private fun close(s: SessionInfo, reason: String, ledShows: Boolean, discard: Boolean = false) {
         if (s === child) child = null
         if (s === top) top = null
         if (s === held) held = null
-        out.sessionEnd(s, reason)
+        out.sessionEnd(s, reason, discard)
         if (s.kind == Kind.COMMAND) {
             cancelTimer?.invoke()
             cancelTimer = null
-            out.commandFeedback(start = false, ledShows = ledShows)
+            if (!discard) out.commandFeedback(start = false, ledShows = ledShows)   // deleted on the phone: no buzz
         }
     }
 

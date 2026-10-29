@@ -27,19 +27,36 @@ class EntryIndex {
         cursor = page.now
     }
 
-    /** A `?since=` response: only what changed. Entries it doesn't mention stay. */
+    /** What was saved on disk last run. */
+    fun restore(saved: List<Entry>, savedCursor: Long?) {
+        entries = saved.sortedWith(NEWEST_FIRST)
+        cursor = savedCursor
+    }
+
+    /** A `?since=` response: only what changed, and what was deleted. Entries it doesn't mention stay. */
     fun merge(page: EntryPage) {
-        if (page.entries.isNotEmpty()) {
+        if (page.entries.isNotEmpty() || page.deleted.isNotEmpty()) {
             val byId = LinkedHashMap<String, Entry>()
             entries.forEach { byId[it.id] = it }
             page.entries.forEach { byId[it.id] = it }
+            page.deleted.forEach { byId.remove(it) }
             entries = byId.values.sortedWith(NEWEST_FIRST)
         }
         if (page.now != null) cursor = page.now
     }
 
-    /** One entry, e.g. from `GET /api/entries/<id>`. */
-    fun upsert(e: Entry) = merge(EntryPage(listOf(e), null))
+    /** Drop entries (deleted here, or the receiver said so). True if any were known. */
+    fun remove(ids: Collection<String>): Boolean {
+        val before = entries.size
+        entries = entries.filter { it.id !in ids }
+        return entries.size != before
+    }
+
+    /**
+     * One entry, e.g. from `GET /api/entries/<id>`. Kept light: the list never holds a
+     * transcript or a summary, only what a list response carries.
+     */
+    fun upsert(e: Entry) = merge(EntryPage(listOf(e.copy(transcript = null, summary = null)), null))
 
     /**
      * Apply a push in place. False if the entry is new to us, so the caller should fetch:

@@ -26,6 +26,7 @@ We call the device the **RTB** (as in *Release the Bee*).
 | Android app: always-on service, auto-reconnect, auto-reseal, WebSocket/TCP/on-phone sinks | **New, first release.** Builds and passes unit tests; end-to-end hardware testing in progress |
 | Receiver: saves sessions, resumes after network drops, serves entries over HTTP | Works and is tested |
 | Local transcription, speakers, summaries and voice commands | **New.** Works on real recordings (whisper.cpp, sherpa-onnx, Gemma 4 E4B) |
+| Notes, reminders that ring, deleting recordings | **New in 0.4.** Unit-tested; hardware testing in progress |
 | Cloudflare relay, spill-to-disk buffering, extracting the token inside the app | Planned |
 
 ## Quick start
@@ -52,17 +53,30 @@ We call the device the **RTB** (as in *Release the Bee*).
    4. Tap **Start**. The first start scans for your RTB. After that the app reconnects on
       its own, including after a reboot.
 
-   The main screen lists your recordings, newest first, once the receiver serves them
-   ([docs/SERVER_API.md](docs/SERVER_API.md)): the summary, the transcript with speakers,
-   and a player that streams the audio from the receiver. The RTB's own button mutes and
-   unmutes it.
+   The app has three tabs, once the receiver serves recordings
+   ([docs/SERVER_API.md](docs/SERVER_API.md)):
+
+   - **Home**: the RTB and receiver at a glance, the next reminders, a button to your
+     notes, and the latest summaries.
+   - **Summaries**: every recording, newest first: the summary, the transcript with
+     speakers, and a player that streams the audio from the receiver. Long press to select
+     one or more and delete them, including the one recording now (it stops and is never
+     transcribed).
+   - **To-do**: reminders as a checklist. Tap one with a time to check or change it.
+
+   **Voice commands** turn into notes and reminders. "New note: gift ideas for Sam…" and
+   "Add milk to my shopping list" collect under **Notes** (on Home). "Remind me tomorrow at
+   3 to call Ana" goes to To-do and rings on the phone at that time, with Done and Snooze.
 
    **The RTB's button** (Settings): a single press records a summary, a double press records
    a command (double press again to end it), and holding records a command while held. Each
    gesture can be switched to summary, command or nothing. A command during a summary is kept
    inside it. When a command starts and ends, the phone vibrates and, if you turn it on, the
-   RTB's light blinks. Settings also has buttons to test the light (blink, brightness, sleep
-   states) by hand.
+   RTB's light blinks (speak after it). Settings also has buttons to test the light (blink,
+   sleep states) by hand.
+
+   A copy kept on the phone ("Also keep a copy on this phone") is deleted a week after the
+   receiver has transcribed it.
 
 Recordings land in `recordings/<device>/<date>/<time>_<session>.aac`. With only the
 standard library, the receiver saves them and serves the audio. To get transcripts and

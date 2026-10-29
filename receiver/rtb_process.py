@@ -571,6 +571,13 @@ Examples:
 "Remind me in two hours to move the car." → \
 {{"action": "CREATE_REMINDER", "note": null, "text": "Move the car", "date": null, "time": null, "in_minutes": 120}}"""
 
+# Appended when the user has notes, so ADD_TO_NOTE names one the phone can find.
+NOTES_SECTION = """
+
+Notes the user already has. For ADD_TO_NOTE, use one of these titles exactly when it is \
+the one meant:
+"""
+
 
 def _post_json(url, body, key, timeout=900):
     headers = {"Content-Type": "application/json"}
@@ -735,7 +742,9 @@ def _strings(v):
     return [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else []
 
 
-def command(args, segments, started_at_ms, check):
+def command(args, segments, started_at_ms, check, notes=()):
+    """One action from a command's transcript. notes: titles of the user's existing
+    notes, newest first."""
     spoken = datetime.datetime.fromtimestamp(started_at_ms / 1000).astimezone()
     # One week only: listing two made Gemma E4B pick the later Monday for "next Monday".
     days = [spoken + datetime.timedelta(days=i) for i in range(8)]
@@ -743,6 +752,8 @@ def command(args, segments, started_at_ms, check):
                          for i, d in enumerate(days))
     system = COMMAND_PROMPT.format(now=f"{spoken:%A %Y-%m-%d %H:%M} ({spoken.tzname()}, UTC{spoken:%z})",
                                    calendar=calendar, tomorrow=f"{days[1]:%Y-%m-%d}")
+    if notes:
+        system += NOTES_SECTION + "\n".join(" ".join(n.split()) for n in notes)
     text = " ".join(s["text"] for s in segments)
     check()
     out, model = chat_json(args, system, f"Command: {text}", COMMAND_SCHEMA, max_tokens=400)
@@ -808,10 +819,11 @@ def preview_of(markdown):
 
 # --------------------------------------------------------------------------- the pipeline
 
-def process(args, aac, entry, save, check=lambda: None):
+def process(args, aac, entry, save, check=lambda: None, notes=()):
     """Process one recording. save(**fields) stores results and status as each step
     finishes, so a failure later on keeps what was done; check() is called between
-    requests and raises Cancelled to stop. Returns per-step timings in seconds."""
+    requests and raises Cancelled to stop. notes: titles of the user's notes, for a
+    command. Returns per-step timings in seconds."""
     have = tools(args)
     stem = aac[:-4]
     timings = {}
@@ -867,7 +879,7 @@ def process(args, aac, entry, save, check=lambda: None):
         fields = {}
         t = time.time()
         if entry.get("kind") == "command":
-            cmd = command(args, segments, entry.get("started_at") or time.time() * 1000, check)
+            cmd = command(args, segments, entry.get("started_at") or time.time() * 1000, check, notes)
             fields.update(command=cmd, summary=None, title=command_title(cmd),
                           preview=preview_of(cmd["text"] + (f" ({cmd['when']})" if cmd["when"] else "")))
         else:

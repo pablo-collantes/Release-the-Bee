@@ -2,9 +2,11 @@ package io.github.pablocollantes.releasethebee.api
 
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -39,6 +41,21 @@ class ReceiverApi(baseUrl: String, private val bearer: String?, private val clie
         call(Request.Builder().url(url).post(ByteArray(0).toRequestBody(null)))
     }
 
+    /** Delete the recording and everything made from it. Already gone counts as done. */
+    fun delete(id: String) {
+        try {
+            call(Request.Builder().url(entryUrl(id)).delete())
+        } catch (e: HttpError) {
+            if (e.code != 404) throw e
+        }
+    }
+
+    /** Change a command's user fields (`done`, `when`, `text`, `note`); returns the entry. */
+    fun patchCommand(id: String, fields: JSONObject): Entry {
+        val body = JSONObject().put("command", fields).toString().toRequestBody(JSON)
+        return EntryJson.entry(call(Request.Builder().url(entryUrl(id)).patch(body)))
+    }
+
     /** The recording as M4A; supports Range, so a player can seek. Needs [authHeaders]. */
     fun audioUrl(id: String): String = entryUrl(id).newBuilder().addPathSegment("audio").build().toString()
 
@@ -58,6 +75,8 @@ class ReceiverApi(baseUrl: String, private val bearer: String?, private val clie
     }
 
     companion object {
+        private val JSON = "application/json".toMediaType()
+
         /** One client for the app's HTTP calls, so connections are pooled and reused. */
         val shared: OkHttpClient by lazy {
             OkHttpClient.Builder()

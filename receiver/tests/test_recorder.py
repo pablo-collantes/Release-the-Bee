@@ -19,7 +19,8 @@ def audio(seq, payload):
 class Rig:
     def __init__(self, finish_after=600):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = rtb_entries.EntryStore(self.tmp.name)
+        self.pushes = []
+        self.store = rtb_entries.EntryStore(self.tmp.name, on_change=self.pushes.append)
         self.rec = rtb_receiver.Recorder(self.tmp.name, self.store, finish_after=finish_after)
 
     def stream(self):
@@ -30,6 +31,17 @@ class Rig:
     def data(self, id):
         with open(self.store.stems[id] + ".aac", "rb") as f:
             return f.read()
+
+    def files(self):
+        """Every file the recorder wrote (the tombstones aside)."""
+        out = []
+        for d, _dirs, names in os.walk(self.tmp.name):
+            out += [os.path.relpath(os.path.join(d, n), self.tmp.name) for n in names if n != "deleted.json"]
+        return sorted(out)
+
+    def delete(self, id, rec=True):
+        r = rtb_receiver.route("DELETE", f"/api/entries/{id}", {}, self.store, None, rec=self.rec if rec else None)
+        return r.status
 
 
 def run(coro):
@@ -166,6 +178,128 @@ class NestingTest(unittest.TestCase):
             s.session_end({"session": "abcd1234-5678"})
             self.assertEqual(rig.data("abcd1234-5678"), b"oldnew")
             self.assertEqual(rig.store.get("abcd1234-5678")["status"], "queued")
+            rig.tmp.cleanup()
+        run(go())
+
+
+class DeleteTest(unittest.TestCase):
+    def test_delete_while_recording(self):
+        async def go():
+            rig = Rig()
+            s = rig.stream()
+            s.session_start({"session": "rec-1", "started_at": START})
+            s.audio(audio(1, b"A1"))
+            self.assertEqual(rig.delete("rec-1"), 200)
+            self.assertIsNone(rig.store.get("rec-1"))                  # gone from the list right away
+            self.assertEqual(rig.pushes[-1]["status"], "deleted")
+            s.audio(audio(2, b"A2"))                                   # audio still arriving is fine
+            s.session_end({"session": "rec-1", "reason": "paused"})
+            self.assertEqual(rig.files(), [])
+            self.assertIsNone(rig.store.get("rec-1"))
+            self.assertEqual(rig.rec.open_sessions, {})
+
+            s.session_start({"session": "rec-2", "started_at": START + 60000})
+            s.audio(audio(3, b"B1"))
+            self.assertEqual(rig.delete("rec-2", rec=False), 200)      # deleted behind the recorder's back
+            s.audio(audio(4, b"B2"))
+            s.session_end({"session": "rec-2"})
+            self.assertEqual(rig.files(), [])
+            rig.tmp.cleanup()
+        run(go())
+
+    def test_delete_while_waiting_for_a_resume(self):
+        async def go():
+            rig = Rig()
+            s = rig.stream()
+            s.session_start({"session": "drop-1", "started_at": START})
+            s.session_start({"session": "drop-2", "started_at": START + 60000})
+            s.audio(audio(1, b"A1"))
+            s.close()                                                  # network drops
+            self.assertEqual(set(rig.rec.pending), {"drop-1", "drop-2"})
+            self.assertEqual(rig.delete("drop-1"), 200)
+            self.assertEqual(rig.delete("drop-2"), 200)
+            rig.rec.finish("drop-1", "not resumed")                     # the grace period runs out
+            s2 = rig.stream()                                          # the phone resumes the other
+            s2.session_start({"session": "drop-2", "started_at": START + 60000, "resumed": True})
+            s2.audio(audio(2, b"A2"))
+            s2.session_end({"session": "drop-2"})
+            self.assertEqual(rig.files(), [])
+            self.assertEqual((rig.store.entries, rig.rec.open_sessions, rig.rec.pending), ({}, {}, {}))
+            rig.tmp.cleanup()
+        run(go())
+
+    def test_deleting_a_summary_keeps_its_commands(self):
+        async def go():
+            rig = Rig()
+            s = rig.stream()
+            s.session_start({"session": "summary-1", "started_at": START})
+            s.audio(audio(1, b"A1"))
+            s.session_start({"session": "command-1", "started_at": START + 5000, "kind": "command",
+                             "parent": "summary-1"})
+            s.audio(audio(2, b"C1"))
+            self.assertEqual(rig.delete("summary-1"), 200)
+            s.audio(audio(3, b"C2"))
+            s.session_end({"session": "command-1"})
+            self.assertEqual(s.current(), "summary-1")                 # back to the (deleted) parent
+            s.audio(audio(4, b"A2"))
+            s.session_end({"session": "summary-1"})
+            self.assertIsNone(rig.store.get("summary-1"))
+            self.assertEqual(rig.store.get("command-1")["status"], "queued")
+            self.assertEqual(rig.data("command-1"), b"C1C2")
+            stem = os.path.relpath(rig.store.stems["command-1"], rig.tmp.name)
+            self.assertEqual(rig.files(), [stem + ".aac", stem + ".json"])
+            rig.tmp.cleanup()
+        run(go())
+
+    def test_session_end_with_discard(self):
+        async def go():
+            rig = Rig()
+            s = rig.stream()
+            s.session_start({"session": "summary-1", "started_at": START})
+            s.audio(audio(1, b"A1"))
+            s.session_start({"session": "oops-1", "started_at": START + 5000, "kind": "command",
+                             "parent": "summary-1"})
+            s.audio(audio(2, b"C1"))
+            s.session_end({"session": "oops-1", "reason": "released", "discard": True})
+            self.assertIsNone(rig.store.get("oops-1"))
+            self.assertTrue(rig.store.is_deleted("oops-1"))
+            self.assertEqual(rig.pushes[-1], {"id": "oops-1", "kind": "command", "status": "deleted", "title": None})
+            self.assertEqual(s.current(), "summary-1")
+            s.audio(audio(3, b"A2"))
+            s.session_end({"session": "summary-1"})
+            self.assertEqual(rig.data("summary-1"), b"A1A2")
+            stem = os.path.relpath(rig.store.stems["summary-1"], rig.tmp.name)
+            self.assertEqual(rig.files(), [stem + ".aac", stem + ".json"])   # nothing of the command
+
+            s.session_end({"session": "summary-1", "discard": True})  # after it finished: same as DELETE
+            self.assertEqual(rig.files(), [])
+            self.assertIsNone(rig.store.get("summary-1"))
+            rig.tmp.cleanup()
+        run(go())
+
+    def test_resuming_a_deleted_session_saves_nothing(self):
+        async def go():
+            rig = Rig()
+            s = rig.stream()
+            s.session_start({"session": "gone-1", "started_at": START})
+            s.audio(audio(1, b"A1"))
+            s.session_end({"session": "gone-1"})
+            self.assertEqual(rig.delete("gone-1"), 200)
+            self.assertEqual(rig.files(), [])
+            pushes = len(rig.pushes)
+
+            s2 = rig.stream()
+            s2.session_start({"session": "gone-1", "started_at": START, "resumed": True})
+            s2.audio(audio(2, b"A2"))
+            s2.close()                                                 # and drops again
+            s3 = rig.stream()
+            s3.session_start({"session": "gone-1", "started_at": START, "resumed": True})
+            s3.audio(audio(3, b"A3"))
+            s3.session_end({"session": "gone-1"})
+            self.assertEqual(rig.files(), [])
+            self.assertIsNone(rig.store.get("gone-1"))
+            self.assertEqual(len(rig.pushes), pushes)                  # nothing new to tell the phone
+            self.assertEqual(rig.delete("gone-1"), 200)
             rig.tmp.cleanup()
         run(go())
 

@@ -69,7 +69,7 @@ front. The LLM never has to guess whether speech was meant as a command.
 | `speakers` | number of distinct speakers, `null` before diarization or if it's unavailable. Commands aren't diarized |
 | `transcript.segments[].speaker` | `S1`, `S2`, … in order of first appearance. `null` if diarization didn't run |
 | `summary` | only for `kind: summary`, once done |
-| `command` | only for `kind: command`, once done: `{"action", "note", "text", "when", "model"}`. `note` is the target note's title (`ADD_TO_NOTE`, `CREATE_NOTE`), `when` is ISO 8601 with offset (`CREATE_REMINDER`), `text` is the body |
+| `command` | only for `kind: command`, once done: `{"action", "note", "text", "when", "done", "model"}`. `note` is the target note's title (`ADD_TO_NOTE`, `CREATE_NOTE`), `when` is ISO 8601 with offset (`CREATE_REMINDER`), `text` is the body. `done` is the user's: `false` when first processed, changed with `PATCH`, kept when the entry is reprocessed |
 | `audio` | size and type of what `/audio` serves: `audio/mp4` once processed, `audio/aac` (no seeking) before that or without ffmpeg |
 | `updated_at` | server clock (ms) of the entry's last change; what `since` compares against |
 
@@ -80,14 +80,47 @@ token. Wrong or missing token → `401`.
 
 | Request | Response |
 |---|---|
-| `GET /api/entries` | `{"entries": [ … ], "now": <ms>}`, newest first, with `transcript`, `summary` and `command` set to `null` |
-| `GET /api/entries?since=<ms>` | only entries changed at or after `<ms>` (server clock), for cheap refreshes |
+| `GET /api/entries` | `{"entries": [ … ], "deleted": [], "now": <ms>}`, newest first, with `transcript` and `summary` set to `null`. `command` is kept for commands (it's small) and `null` otherwise |
+| `GET /api/entries?since=<ms>` | only entries changed at or after `<ms>` (server clock), for cheap refreshes. `deleted` lists the ids deleted at or after `<ms>` |
 | `GET /api/entries/<id>` | the full entry, `404` if unknown |
 | `GET /api/entries/<id>/audio` | the recording as `audio/mp4` (AAC remuxed into M4A, so players can seek). Supports `Range` |
 | `POST /api/entries/<id>/reprocess` | queue it again (after changing models). `202`, or `409` while it's still recording |
+| `PATCH /api/entries/<id>` | change a processed command (see below). `200` with the full entry |
+| `DELETE /api/entries/<id>` | delete the entry and its audio. `200` `{"id": "<id>", "deleted": true}`, also if it was already deleted. `404` if unknown |
 
 The list response also carries `"now": <server ms>`, which the client passes as `since`
 next time.
+
+### Changing a command
+
+`PATCH /api/entries/<id>` takes `{"command": { … }}` with any of these fields. The
+others are left as they are, and unknown fields are ignored.
+
+| Field | Value |
+|---|---|
+| `done` | `true` or `false` |
+| `when` | ISO 8601 with an offset (`2026-10-29T15:00:00-05:00`, or `Z`), or `null` |
+| `text` | a string |
+| `note` | a string, or `null` |
+
+The change bumps `updated_at`, so the next `?since=` returns the entry, and it is pushed
+to connected phones. Errors: `400` if the body isn't JSON, has no `command` object, or a
+field has the wrong type; `404` for an unknown id; `409` `{"error": "not a processed
+command"}` if the entry has no `command` yet (a summary, or a command still being
+processed); `413` if the body is over 64 KiB.
+
+### Deleting an entry
+
+`DELETE /api/entries/<id>` removes the entry from the list at once and deletes its files
+(`.aac`, `.m4a`, `.json`). If the worker is processing it, it stops. If the recording is
+still going (or the phone dropped and may resume it), the audio that still arrives is
+thrown away and the files are deleted when the session ends. Deleting a summary doesn't
+delete the commands recorded inside it: they are entries of their own.
+
+A deleted id stays deleted: if the phone resumes that session later, its audio is
+discarded and no entry comes back. The receiver remembers deleted ids for 90 days
+(`deleted.json` in the recordings folder). A client that last synced longer ago than
+that should fetch the whole list again.
 
 ## Pushes over the WebSocket
 
@@ -98,8 +131,15 @@ connection to tell it when an entry changes. That way the app never polls:
 {"type":"entry","id":"5f0c2a91-…","kind":"summary","status":"done","title":"Quarterly planning sync"}
 ```
 
-It is sent on every status change. The app then fetches `GET /api/entries/<id>` if it
-needs the body.
+It is sent on every status change and after a `PATCH`. When an entry is deleted,
+`status` is `deleted` and `title` is `null`:
+
+```json
+{"type":"entry","id":"5f0c2a91-…","kind":"command","status":"deleted","title":null}
+```
+
+The app then fetches `GET /api/entries/<id>` if it needs the body, or drops the entry
+if it was deleted.
 
 ## Processing details (reference receiver)
 

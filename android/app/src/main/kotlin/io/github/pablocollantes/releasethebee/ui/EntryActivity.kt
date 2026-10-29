@@ -30,8 +30,8 @@ import android.widget.Toast
 import io.github.pablocollantes.releasethebee.R
 import io.github.pablocollantes.releasethebee.api.Entry
 import io.github.pablocollantes.releasethebee.api.ReceiverApi
+import io.github.pablocollantes.releasethebee.data.Library
 import io.github.pablocollantes.releasethebee.service.AppStatus
-import io.github.pablocollantes.releasethebee.sink.EntryPush
 
 /**
  * One recording: its summary and action items (or the command), the transcript with
@@ -95,13 +95,16 @@ class EntryActivity : Activity() {
         }
     }
 
-    private val onEntry: (EntryPush) -> Unit = { p ->
+    /** The list changed: follow this recording's status, or close if it was deleted. */
+    private val onLibrary: () -> Unit = {
+        val listed = Library.index[id]
         val e = entry
-        if (p.id == id && e != null) {
-            val status = Entry.Status.of(p.status)
-            entry = e.copy(status = status, title = p.title ?: e.title)
+        if (listed == null && e != null && Library.fetchedOk) {
+            finish()
+        } else if (listed != null && e != null && (listed.status != e.status || listed.title != e.title)) {
+            entry = e.copy(status = listed.status, title = listed.title ?: e.title)
             render()
-            if (status.finished || status == Entry.Status.QUEUED) load()   // new transcript, summary or audio
+            if (listed.status.finished || listed.status == Entry.Status.QUEUED) load()   // new transcript, summary or audio
         }
     }
 
@@ -111,7 +114,8 @@ class EntryActivity : Activity() {
         id = intent.getStringExtra(EXTRA_ID) ?: return finish()
         ui = Ui(this)
         fmt = Format(use24h = android.text.format.DateFormat.is24HourFormat(this))
-        entry = Receiver.index[id]          // the list's copy: title and status, right away
+        Library.load(this)
+        entry = Library.index[id]           // the list's copy: title and status, right away
         setContentView(buildUi())
         render()
         load()
@@ -119,11 +123,11 @@ class EntryActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        AppStatus.addEntryListener(onEntry)
+        Library.addListener(onLibrary)
     }
 
     override fun onStop() {
-        AppStatus.removeEntryListener(onEntry)
+        Library.removeListener(onLibrary)
         pause()
         super.onStop()
     }
@@ -151,7 +155,7 @@ class EntryActivity : Activity() {
                 val e = result?.getOrNull()
                 if (e != null) {
                     entry = e
-                    Receiver.index.upsert(e)
+                    Library.index.upsert(e)
                     problem = null
                 } else {
                     problem = Receiver.problem(src, result?.exceptionOrNull())
@@ -178,7 +182,7 @@ class EntryActivity : Activity() {
                 if (isDestroyed) return@runOnUiThread
                 if (r.isSuccess) {
                     entry = entry?.copy(status = Entry.Status.QUEUED, error = null)
-                    entry?.let { Receiver.index.upsert(it) }
+                    entry?.let { Library.index.upsert(it) }
                     toast("Queued. This page updates when it's done.")
                 } else {
                     toast(Receiver.problem(Receiver.Source.Ready(a), r.exceptionOrNull()).title)
@@ -186,6 +190,28 @@ class EntryActivity : Activity() {
                 render()
             }
         }
+    }
+
+    private fun confirmDelete() {
+        val e = entry
+        val live = id in AppStatus.snapshot.live
+        val made = e?.command?.action in listOf("CREATE_NOTE", "ADD_TO_NOTE", "CREATE_REMINDER")
+        AlertDialog.Builder(this)
+            .setTitle("Delete this recording?")
+            .setMessage(buildString {
+                append("Its audio, transcript and summary are deleted from your receiver and this phone. This can't be undone.")
+                if (made) append("\n\nThe ${if (e?.command?.action == "CREATE_REMINDER") "reminder" else "note"} made from it goes too.")
+                if (live) append("\n\nIt's recording now: it stops, and isn't transcribed.")
+            })
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ ->
+                val app = applicationContext
+                Library.delete(this, listOf(id)) { failed ->
+                    if (failed > 0) Toast.makeText(app, "Couldn't reach your receiver: not deleted.", Toast.LENGTH_LONG).show()
+                }
+                finish()
+            }
+            .show()
     }
 
     // ------------------------------------------------------------------ render
@@ -451,7 +477,7 @@ class EntryActivity : Activity() {
 
     private fun buildUi(): View {
         reprocessBtn = ui.link("Reprocess") { confirmReprocess() }.apply { visibility = View.GONE }
-        val (bar, _) = ui.topBar("", { finish() }, reprocessBtn)
+        val (bar, _) = ui.topBar("", { finish() }, reprocessBtn, ui.icon(R.drawable.ic_delete, "Delete") { confirmDelete() })
 
         titleView = ui.text(24f, bold = true).apply {
             letterSpacing = -0.01f

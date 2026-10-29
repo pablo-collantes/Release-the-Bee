@@ -16,6 +16,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import kotlin.math.min
 
 /**
@@ -39,7 +40,10 @@ import kotlin.math.min
  * lets the Bluetooth stack wait for the RTB to come back in range instead of polling.
  *
  * Whether the RTB should record survives reconnects: muted by its button (or by the
- * app, [setRecording]) stays muted after the link comes back. Pause wins over both.
+ * app, [setRecording]) stays muted after the link comes back. Pause wins over both. A
+ * command's temporary unmute isn't remembered: if the link drops mid-command, the RTB
+ * goes back to its resting state. State events right after we changed the state
+ * ourselves are the RTB echoing us (or settling), not its button.
  *
  * Everything runs on one private HandlerThread (GATT callbacks included), so there are
  * no locks. Listener callbacks arrive on that thread.
@@ -70,9 +74,8 @@ class RtbLink(
         fun onStreamEnd(reason: String)
         /** A button gesture the RTB reports but doesn't act on. Not sent while paused. */
         fun onButton(b: Button)
-        /** The RTB answered a request sent outside the handshake (the light tests, [setBrightness]…). */
+        /** The RTB answered a request sent outside the handshake (the light tests…). */
         fun onReply(line: String)
-        fun onBrightness(level: Int)
         /** Whether the RTB should record changed (its button, or [setRecording]): keep it for the next start. */
         fun onRecordingChoice(on: Boolean)
     }
@@ -90,7 +93,9 @@ class RtbLink(
     private var device: BluetoothDevice? = null     // the confirmed RTB, as the stack knows it
     private var running = false
     private var paused = false
-    private var wantRecording = recordOnConnect     // the RTB's last chosen state: its button, or ours
+    private var wantRecording = recordOnConnect     // the RTB's resting state: its button, or ours
+    private var borrowed = false                     // recording just for a command; forgotten with the link
+    private var settleUntil = 0L                     // state events before this follow our own change
     private var blinking = false                     // our own mute/unmute flicker: ignore its state events
     private var blinkGen = 0
     private var stateTests = 0                       // sleep requests awaiting their reply
@@ -149,9 +154,20 @@ class RtbLink(
     /**
      * Record or mute, as the RTB's button would. Remembered across reconnects; ignored
      * (until resumed) while paused. Mid-handshake, the handshake applies it at its end.
+     *
+     * [temporary]: just for a command. Recording that way isn't remembered; stopping that
+     * way goes back to the resting state (or mutes, if the RTB was recording anyway).
      */
-    fun setRecording(on: Boolean) = post {
-        choose(on)
+    fun setRecording(on: Boolean, temporary: Boolean = false) = post {
+        when {
+            !temporary -> {
+                borrowed = false
+                choose(on)
+            }
+            on -> borrowed = true
+            borrowed -> borrowed = false
+            else -> choose(false)
+        }
         if (gatt == null || control == null || step != null) return@post
         reconcile()
     }
@@ -168,22 +184,17 @@ class RtbLink(
         blinking = true
         val gen = ++blinkGen
         val at = { delay: Long, f: () -> Unit -> h.postDelayed({ if (gen == blinkGen && gatt != null) f() }, delay) }
+        // The RTB drops state changes that come too fast: keep the gap as long as the flash.
+        val gap = maxOf(offMs, BLINK_MIN_MS)
         var t = 0L
         repeat(times.coerceIn(1, 5)) {
             at(t) { writeControl(RtbProtocol.setDeviceState(flip)) }
             at(t + offMs) { writeControl(RtbProtocol.setDeviceState(back)) }
-            t += offMs + BLINK_GAP_MS
+            t += offMs + gap
         }
         at(t + BLINK_SETTLE_MS) { blinking = false }
         log("blink: ${if (streaming) "off" else "on"} for $offMs ms, ${times}×")
     }
-
-    fun setBrightness(level: Int) = direct("brightness ${level.coerceIn(0, 100)}") {
-        writeControl(RtbProtocol.setBrightness(level))
-        writeControl(RtbProtocol.getBrightness())   // read back what the RTB kept
-    }
-
-    fun readBrightness() = direct("read brightness") { writeControl(RtbProtocol.getBrightness()) }
 
     /**
      * Put the RTB in a sleep state ([RtbProtocol.STATE_SLEEP_HW_VAD] or
@@ -340,6 +351,7 @@ class RtbLink(
 
     private fun teardown(reason: String) {
         endStream(reason)
+        borrowed = false                // a command ends with the link
         blinkGen++
         blinking = false
         stateTests = 0
@@ -515,12 +527,16 @@ class RtbLink(
                 send(Step.RECORD, RtbProtocol.setDeviceState(RtbProtocol.STATE_RECORDING))
             }
             RtbProtocol.OP_SET_DEVICE_STATE -> when (step) {
-                Step.RECORD -> if (paused || !wantRecording) muteNow() else beginStream()
+                Step.RECORD -> {
+                    settle()
+                    if (!wanted) muteNow() else beginStream()
+                }
                 Step.MUTE -> {
                     step = null
                     h.removeCallbacks(replyTimeout)
                     attempts = 0
-                    if (wantRecording && !paused) record() else settledMuted()   // asked to record meanwhile
+                    settle()
+                    if (wanted) record() else settledMuted()   // asked to record meanwhile
                 }
                 // Only a sleep test's reply: audio can start a recording before its own ack lands.
                 null -> if (stateTests > 0) {
@@ -528,12 +544,6 @@ class RtbLink(
                     reply("RTB state set: ${r.payload.toHex()}")
                 }
                 else -> {}
-            }
-            RtbProtocol.OP_SET_BRIGHTNESS -> reply("RTB took the brightness")
-            RtbProtocol.OP_GET_BRIGHTNESS -> r.payload.firstOrNull()?.let {
-                val level = it.toInt() and 0xFF
-                listener.onBrightness(level)
-                reply("RTB brightness is $level")
             }
             else -> reply("RTB ok 0x%04x %s".format(r.op, r.payload.toHex()))
         }
@@ -567,7 +577,14 @@ class RtbLink(
         if (e.tag != RtbProtocol.TAG_EVENT_DEVICE_STATE || e.payload.isEmpty()) return
         if (gatt == null || step != null || paused || blinking) return     // our own handshake, pause or blink caused it
         val recording = e.payload[0].toInt() == RtbProtocol.STATE_RECORDING
-        choose(recording)                   // its button: keep that choice across reconnects
+        if (recording == wanted && recording == streaming) return         // what we asked for
+        if (SystemClock.elapsedRealtime() < settleUntil) {
+            // Right after we set the state: the RTB settling, not its button. Ours stands.
+            log("RTB reported ${if (recording) "recording" else "muted"} right after we set it; setting it again")
+            return if (wanted) record() else muteNow()
+        }
+        borrowed = false                    // its button: keep that choice across reconnects
+        choose(recording)
         if (!recording && streaming) {
             endStream("RTB stopped recording")
             setState(State.MUTED, "the RTB stopped recording (its button?); waiting for it to resume")
@@ -592,12 +609,15 @@ class RtbLink(
     }
 
     private fun afterSealed() {
-        if (paused || !wantRecording) muteNow() else send(Step.NONCE, RtbProtocol.getSessionNonce())
+        if (!wanted) muteNow() else send(Step.NONCE, RtbProtocol.getSessionNonce())
     }
 
-    /** Bring the RTB in line with [wantRecording] and [paused]. Only between steps. */
+    /** Whether the RTB should be recording now: its resting state or a command, unless paused. */
+    private val wanted get() = (wantRecording || borrowed) && !paused
+
+    /** Bring the RTB in line with [wanted]. Only between steps. */
     private fun reconcile() {
-        val want = wantRecording && !paused
+        val want = wanted
         when {
             want && !streaming -> record()
             !want && streaming -> {
@@ -617,6 +637,10 @@ class RtbLink(
     private fun muteNow() {
         if (paused) decryptor = null
         send(Step.MUTE, RtbProtocol.setDeviceState(RtbProtocol.STATE_MUTE))
+    }
+
+    private fun settle() {
+        settleUntil = SystemClock.elapsedRealtime() + STATE_SETTLE_MS
     }
 
     private fun choose(on: Boolean) {
@@ -691,7 +715,12 @@ class RtbLink(
         val dec = decryptor ?: return
         if (!streaming) {
             // Audio can beat the SetDeviceState ack; it confirms the same thing.
-            if (step == Step.RECORD && !paused && wantRecording) beginStream() else return
+            if (step == Step.RECORD && wanted) {
+                settle()
+                beginStream()
+            } else {
+                return
+            }
         }
         val f = dec.decrypt(d) ?: return
         if (f.containsAdtsSync) {
@@ -736,7 +765,8 @@ class RtbLink(
         private const val SCAN_TIMEOUT_MS = 30_000L
         private const val REPLY_TIMEOUT_MS = 8_000L
         private const val STALE_NONCE_FRAMES = 4
-        private const val BLINK_GAP_MS = 400L       // between flashes of one blink
+        private const val BLINK_MIN_MS = 500L       // shorter flashes and gaps get swallowed by the RTB
         private const val BLINK_SETTLE_MS = 1_500L  // late state events from a blink are still ignored
+        private const val STATE_SETTLE_MS = 1_500L  // state events this soon after our own change are echoes
     }
 }

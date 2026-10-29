@@ -11,7 +11,8 @@ interface AudioSink {
     fun open()
     fun sessionStart(s: SessionInfo)
     fun audio(f: AudioFrame)
-    fun sessionEnd(s: SessionInfo, reason: String)
+    /** [discard]: the user deleted the recording while it ran. Nothing of it should be kept. */
+    fun sessionEnd(s: SessionInfo, reason: String, discard: Boolean = false)
     fun close()
 }
 

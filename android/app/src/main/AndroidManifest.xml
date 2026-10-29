@@ -25,9 +25,13 @@
     <!-- A buzz when a command recording starts and ends -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Reminders ring on time. Granted to reminder apps without asking (Android 13+). -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
     <!-- usesCleartextTraffic: receivers are usually ws:// over a VPN or LAN that already
          encrypts the path. Use wss:// when the path is the open internet. -->
     <application
+        android:name=".App"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="Release the Bee"
@@ -51,6 +55,16 @@
             android:parentActivityName=".ui.MainActivity" />
 
         <activity
+            android:name=".ui.NotesActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <activity
+            android:name=".ui.NoteActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.NotesActivity" />
+
+        <activity
             android:name=".ui.SettingsActivity"
             android:exported="false"
             android:parentActivityName=".ui.MainActivity"
@@ -60,6 +74,10 @@
             android:name=".service.RtbService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <receiver
+            android:name=".service.ReminderReceiver"
+            android:exported="false" />
 
         <!-- Exported only to receive these protected system broadcasts. -->
         <receiver

@@ -18,7 +18,7 @@ abstract class NetworkSink(
     protected sealed interface Item {
         class Start(val s: SessionInfo) : Item
         class Audio(val f: AudioFrame) : Item
-        class End(val s: SessionInfo, val reason: String) : Item
+        class End(val s: SessionInfo, val reason: String, val discard: Boolean) : Item
     }
 
     private val lock = Object()
@@ -59,7 +59,7 @@ abstract class NetworkSink(
 
     override fun sessionStart(s: SessionInfo) = offer(Item.Start(s))
     override fun audio(f: AudioFrame) = offer(Item.Audio(f))
-    override fun sessionEnd(s: SessionInfo, reason: String) = offer(Item.End(s, reason))
+    override fun sessionEnd(s: SessionInfo, reason: String, discard: Boolean) = offer(Item.End(s, reason, discard))
 
     /** Frames currently waiting to be sent. */
     fun backlog(): Int = synchronized(lock) { audioQueued }

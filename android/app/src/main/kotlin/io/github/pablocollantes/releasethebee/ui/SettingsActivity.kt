@@ -24,7 +24,6 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import io.github.pablocollantes.releasethebee.rtb.RtbKey
@@ -88,9 +87,6 @@ class SettingsActivity : Activity() {
     private lateinit var lightNote: TextView
     private lateinit var lightButtons: List<View>
     private lateinit var replyView: TextView
-    private lateinit var brightnessBar: SeekBar
-    private lateinit var brightnessValue: TextView
-    private var brightnessShown: Int? = null
 
     private val onStatus: () -> Unit = {
         renderStatus()
@@ -366,11 +362,6 @@ class SettingsActivity : Activity() {
         lightNote.text = if (ready) "Each button sends one request to the RTB. Its answer shows below and in the log."
         else "Connect the RTB first (Start, at the top) to try these."
         replyView.text = st.reply.ifBlank { "No answer yet" }
-        val b = st.brightness
-        if (b != null && b != brightnessShown) {
-            brightnessShown = b
-            brightnessBar.progress = b
-        }
     }
 
     private fun renderSetup() {
@@ -578,7 +569,8 @@ class SettingsActivity : Activity() {
             buttonTintList = ColorStateList.valueOf(ui.accent)
         }
         root.addView(recordBox)
-        root.addView(ui.text(13f, ui.fgMuted, value = "Not needed to listen back: the player streams each recording from your receiver.").apply {
+        root.addView(ui.text(13f, ui.fgMuted, value = "Not needed to listen back: the player streams each recording from your receiver. " +
+            "A copy is deleted a week after the receiver has transcribed it.").apply {
             setPadding(ui.dp(32), 0, 0, 0)
         })
         root.addView(ui.primaryButton("Save destination") { saveDestination() }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
@@ -667,13 +659,13 @@ class SettingsActivity : Activity() {
             addView(vibrate, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             addView(tryIt)
         }, full())
-        root.addView(check("Blink the RTB's light: once at the start, twice at the end", settings.feedbackBlink) {
+        root.addView(check("Blink the RTB's light when a command starts", settings.feedbackBlink) {
             settings.feedbackBlink = it
         }, full())
         root.addView(note(
-            "Only for a command inside a summary recording: from a muted RTB, its light coming on and going " +
-                "off already shows it. A blink mutes the RTB for a moment, so that bit of audio is lost. " +
-                "Pick a blink length you can see below.",
+            "Speak after the blink: each blink mutes the RTB for its length, so what's said during it is lost. " +
+                "A command inside a summary also blinks twice when it ends; from a muted RTB, the light " +
+                "going off shows that. Set the blink length below.",
         ).apply { setPadding(ui.dp(32), 0, 0, 0) })
     }
 
@@ -685,39 +677,13 @@ class SettingsActivity : Activity() {
 
         root.addView(label("Blink length (also used for command feedback)"))
         root.addView(choice(
-            listOf("0.1 s" to 100, "0.3 s" to 300, "0.6 s" to 600, "1 s" to 1000),
+            listOf("0.5 s" to 500, "1 s" to 1000, "1.5 s" to 1500, "2 s" to 2000),
             settings.blinkMs,
             horizontal = true,
         ) { settings.blinkMs = it })
         val blink1 = ui.button("Blink once") { test(RtbService.TEST_BLINK, 1) }
         val blink2 = ui.button("Blink twice") { test(RtbService.TEST_BLINK, 2) }
         root.addView(weighted(blink1, blink2), full(top = 4))
-
-        root.addView(label("Brightness (the stock app uses 35 to 100)"))
-        brightnessValue = ui.text(15f, bold = true).apply { minWidth = ui.dp(36) }
-        brightnessBar = SeekBar(this).apply {
-            max = 100
-            progress = AppStatus.snapshot.brightness ?: 65
-            progressTintList = ColorStateList.valueOf(ui.accent)
-            thumbTintList = ColorStateList.valueOf(ui.accent)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
-                    brightnessValue.text = value.toString()
-                }
-                override fun onStartTrackingTouch(bar: SeekBar) {}
-                override fun onStopTrackingTouch(bar: SeekBar) {}
-            })
-        }
-        brightnessValue.text = brightnessBar.progress.toString()
-        root.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(brightnessBar, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            addView(brightnessValue)
-        }, full())
-        val setB = ui.button("Set") { test(RtbService.TEST_BRIGHTNESS, brightnessBar.progress) }
-        val readB = ui.button("Read") { test(RtbService.TEST_READ_BRIGHTNESS) }
-        root.addView(weighted(setB, readB), full(top = 4))
 
         root.addView(label("Recording state, like a single press"))
         val record = ui.button("Record") { test(RtbService.TEST_RECORD, 1) }
@@ -734,7 +700,7 @@ class SettingsActivity : Activity() {
             addView(ui.text(12f, ui.fgMuted, bold = true, value = "LAST ANSWER"))
             addView(replyView)
         }, full(top = 8))
-        lightButtons = listOf(blink1, blink2, brightnessBar, setB, readB, record, mute, sleepHw, sleepSw)
+        lightButtons = listOf(blink1, blink2, record, mute, sleepHw, sleepSw)
     }
 
     private fun test(what: String, value: Int = 0) {

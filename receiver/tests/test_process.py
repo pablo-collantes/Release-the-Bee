@@ -3,10 +3,11 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import helpers  # noqa: F401
 import rtb_process as p
-from helpers import adts
+from helpers import Args, adts
 
 
 def seg(a, b, text="hello there"):
@@ -175,6 +176,32 @@ class LlmHelpersTest(unittest.TestCase):
         long = p.preview_of("word " * 100)
         self.assertLessEqual(len(long), 200)
         self.assertTrue(long.endswith("…"))
+
+
+class CommandPromptTest(unittest.TestCase):
+    def command(self, notes):
+        """Run command() against a fake LLM; returns (system prompt, result)."""
+        prompts = []
+
+        def chat_json(args, system, user, schema, max_tokens=1200):
+            prompts.append(system)
+            return {"action": "ADD_TO_NOTE", "note": "Groceries", "text": "Milk", "date": None, "time": None,
+                    "in_minutes": None}, "m"
+        with mock.patch.object(p, "chat_json", chat_json):
+            out = p.command(Args(), [seg(0, 2, "Add milk to my grocery list.")], 1761651534000, lambda: None, notes)
+        return prompts[0], out
+
+    def test_existing_note_titles_are_in_the_prompt(self):
+        system, out = self.command(["Groceries", "Gift ideas for\nSam"])
+        self.assertIn("\n\nNotes the user already has. For ADD_TO_NOTE, use one of these titles exactly when it "
+                      "is the one meant:\nGroceries\nGift ideas for Sam", system)
+        self.assertTrue(system.endswith("Gift ideas for Sam"))
+        self.assertEqual((out["action"], out["note"], out["text"]), ("ADD_TO_NOTE", "Groceries", "Milk"))
+
+    def test_no_notes_no_section(self):
+        system, _ = self.command(())
+        self.assertNotIn("Notes the user already has", system)
+        self.assertEqual(system, self.command([])[0])
 
 
 class AdtsTest(unittest.TestCase):

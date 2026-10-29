@@ -55,6 +55,11 @@ When the RTB stops (the link dropped, the user paused, or the app stopped):
 {"type":"session_end","session":"<uuid>","reason":"paused"}
 ```
 
+`"discard": true` (optional) means the user cancelled the recording: the receiver
+deletes it, exactly like `DELETE /api/entries/<id>` ([SERVER_API.md](SERVER_API.md)),
+instead of processing it. A discarded command inside a summary leaves the summary
+recording.
+
 A `session_end` can be missing, because the phone may die or lose signal. Give an
 unfinished session a grace period, then close it yourself (the reference receiver
 waits 10 minutes).
@@ -79,6 +84,9 @@ summarized), so the app can refresh without polling:
 ```json
 {"type":"entry","id":"<session uuid>","kind":"summary","status":"done","title":"…"}
 ```
+
+`status` is `deleted` once the entry has been deleted (from any phone, or by a
+`discard`).
 
 The app ignores message types it doesn't know.
 

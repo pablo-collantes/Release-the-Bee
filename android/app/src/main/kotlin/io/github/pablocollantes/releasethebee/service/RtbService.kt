@@ -19,6 +19,7 @@ import android.os.Looper
 import android.os.PowerManager
 import io.github.pablocollantes.releasethebee.BuildConfig
 import io.github.pablocollantes.releasethebee.R
+import io.github.pablocollantes.releasethebee.data.Library
 import io.github.pablocollantes.releasethebee.rtb.RtbKey
 import io.github.pablocollantes.releasethebee.rtb.RtbLink
 import io.github.pablocollantes.releasethebee.rtb.hexToBytes
@@ -92,6 +93,13 @@ class RtbService : Service(), RtbLink.Listener {
                 shutdown { begin() }
                 return START_STICKY
             }
+            ACTION_DISCARD -> {
+                val id = intent.getStringExtra(EXTRA_ID)
+                if (id != null && recorder?.discard(id) != true) AppStatus.log("delete: ${id.take(8)} wasn't recording anymore")
+                if (link != null || AppStatus.snapshot.serviceRunning) return START_STICKY
+                stopSelf()
+                return START_NOT_STICKY
+            }
             ACTION_TEST -> {
                 val l = link
                 if (l == null) {
@@ -102,8 +110,6 @@ class RtbService : Service(), RtbLink.Listener {
                 }
                 val v = intent.getIntExtra(EXTRA_VALUE, 0)
                 when (intent.getStringExtra(EXTRA_TEST)) {
-                    TEST_BRIGHTNESS -> l.setBrightness(v)
-                    TEST_READ_BRIGHTNESS -> l.readBrightness()
                     TEST_BLINK -> l.blink(settings.blinkMs.toLong(), v)
                     TEST_RECORD -> l.setRecording(v != 0)
                     TEST_SLEEP -> l.sleep(v)
@@ -207,7 +213,7 @@ class RtbService : Service(), RtbLink.Listener {
                 ) { e ->
                     // Titles are the user's content: keep them out of the log.
                     AppStatus.log("receiver: recording ${e.id.take(8)} is ${e.status ?: "updated"}")
-                    AppStatus.entryPushed(e)
+                    main.post { Library.onPush(this, e) }
                 }
             }
             Settings.SinkKind.TCP -> if (settings.tcpHost.isNotBlank()) {
@@ -223,7 +229,11 @@ class RtbService : Service(), RtbLink.Listener {
     }
 
     private fun sinkStatus(name: String): (String) -> Unit = { status ->
+        val was = AppStatus.snapshot.sinks[name]
         AppStatus.update { it.copy(sinks = it.sinks + (name to status)) }
+        // Back in touch with the receiver: catch up on the pushes missed while away
+        // (reminders' alarms depend on them).
+        if (name == "network" && status == "connected" && was != "connected") main.post { Library.refresh(this) }
         if (!status.startsWith("recording")) AppStatus.log("$name: $status")
         refreshNotification(force = false)
     }
@@ -286,8 +296,6 @@ class RtbService : Service(), RtbLink.Listener {
         AppStatus.update { it.copy(reply = line) }
     }
 
-    override fun onBrightness(level: Int) = AppStatus.update { it.copy(brightness = level) }
-
     override fun onRecordingChoice(on: Boolean) {
         settings.rtbRecording = on
     }
@@ -299,33 +307,47 @@ class RtbService : Service(), RtbLink.Listener {
             sinks.forEach { it.sessionStart(s) }
             val inside = s.parentId?.let { " inside ${it.take(8)}" } ?: ""
             AppStatus.log("recording ${s.id.take(8)}: ${s.kind.wire}$inside, from ${s.trigger?.wire ?: "?"}")
+            val live = recorder?.live.orEmpty()
             if (s.parentId == null) {
                 frames = 0
-                AppStatus.update { it.copy(sessionStartedAt = s.startedAtMs, frames = 0, commandOpen = s.kind == SessionInfo.Kind.COMMAND) }
+                AppStatus.update {
+                    it.copy(sessionStartedAt = s.startedAtMs, frames = 0, commandOpen = s.kind == SessionInfo.Kind.COMMAND, live = live)
+                }
             } else {
-                AppStatus.update { it.copy(commandOpen = true) }
+                AppStatus.update { it.copy(commandOpen = true, live = live) }
             }
             refreshNotification(force = true)
         }
 
         override fun audio(f: AudioFrame) = sinks.forEach { it.audio(f) }
 
-        override fun sessionEnd(s: SessionInfo, reason: String) {
-            sinks.forEach { it.sessionEnd(s, reason) }
+        override fun sessionEnd(s: SessionInfo, reason: String, discard: Boolean) {
+            sinks.forEach { it.sessionEnd(s, reason, discard) }
+            if (discard) AppStatus.log("recording ${s.id.take(8)} deleted while recording; the receiver throws it away")
+            val live = recorder?.live.orEmpty()
             AppStatus.update {
-                if (s.parentId == null) it.copy(sessionStartedAt = null, commandOpen = false) else it.copy(commandOpen = false)
+                if (s.parentId == null) it.copy(sessionStartedAt = null, commandOpen = false, live = live)
+                else it.copy(commandOpen = false, live = live)
             }
             refreshNotification(force = true)
         }
 
-        override fun setRecording(on: Boolean) {
-            link?.setRecording(on)
+        override fun setRecording(on: Boolean, temporary: Boolean) {
+            link?.setRecording(on, temporary)
         }
 
         override fun commandFeedback(start: Boolean, ledShows: Boolean) {
             if (settings.feedbackVibrate) if (start) haptics.commandStart() else haptics.commandEnd()
-            // The light already changes when the RTB unmutes or mutes for the command.
-            if (settings.feedbackBlink && !ledShows) link?.blink(settings.blinkMs.toLong(), if (start) 1 else 2)
+            if (!settings.feedbackBlink) return
+            // At the start, always: it says "command, speak now" (from a muted RTB, after the
+            // light has come on and the RTB has settled). At the end, only inside a summary:
+            // otherwise the light going off already says it.
+            val ms = settings.blinkMs.toLong()
+            when {
+                start && ledShows -> main.postDelayed({ link?.blink(ms, 1) }, BLINK_AFTER_UNMUTE_MS)
+                start -> link?.blink(ms, 1)
+                !ledShows -> link?.blink(ms, 2)
+            }
         }
 
         override fun schedule(ms: Long, f: () -> Unit): () -> Unit {
@@ -404,11 +426,13 @@ class RtbService : Service(), RtbLink.Listener {
         const val ACTION_TEST = "io.github.pablocollantes.releasethebee.TEST"
         const val EXTRA_TEST = "test"
         const val EXTRA_VALUE = "value"
-        const val TEST_BRIGHTNESS = "brightness"            // value: 0-100
-        const val TEST_READ_BRIGHTNESS = "read_brightness"
         const val TEST_BLINK = "blink"                      // value: how many flashes
         const val TEST_RECORD = "record"                    // value: 1 record, 0 mute
         const val TEST_SLEEP = "sleep"                      // value: device state 2 or 4
+
+        /** Stop and throw away recording [EXTRA_ID]: the user deleted it while it ran. */
+        const val ACTION_DISCARD = "io.github.pablocollantes.releasethebee.DISCARD"
+        const val EXTRA_ID = "id"
 
         /** Debug builds only, from adb: see `src/debug/…/DebugReceiver.kt`. */
         const val ACTION_DEBUG_SEND = "io.github.pablocollantes.releasethebee.DEBUG_SEND"
@@ -417,6 +441,8 @@ class RtbService : Service(), RtbLink.Listener {
         private const val CHANNEL = "link"
         private const val NOTIFICATION_ID = 1
         private const val WAKELOCK_MS = 10 * 60 * 1000L
+        /** The RTB drops a state change sent right after the one that unmuted it. */
+        private const val BLINK_AFTER_UNMUTE_MS = 800L
 
         val PERMISSIONS = arrayOf(
             Manifest.permission.BLUETOOTH_SCAN,
@@ -430,6 +456,10 @@ class RtbService : Service(), RtbLink.Listener {
 
         fun test(ctx: Context, what: String, value: Int = 0) {
             ctx.startService(Intent(ctx, RtbService::class.java).setAction(ACTION_TEST).putExtra(EXTRA_TEST, what).putExtra(EXTRA_VALUE, value))
+        }
+
+        fun discard(ctx: Context, id: String) {
+            ctx.startService(Intent(ctx, RtbService::class.java).setAction(ACTION_DISCARD).putExtra(EXTRA_ID, id))
         }
 
         fun send(ctx: Context, action: String) {

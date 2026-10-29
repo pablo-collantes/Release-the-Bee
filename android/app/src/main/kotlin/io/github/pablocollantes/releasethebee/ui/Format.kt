@@ -20,6 +20,7 @@ class Format(
     private val weekdayFmt = DateTimeFormatter.ofPattern("EEEE", locale)
     private val dateFmt = DateTimeFormatter.ofPattern("EEE d MMM", locale)
     private val dateYearFmt = DateTimeFormatter.ofPattern("EEE d MMM yyyy", locale)
+    private val isoFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.ROOT)
 
     /** "14:38" (or "2:38 PM"). */
     fun clock(ms: Long): String = clockFmt.format(Instant.ofEpochMilli(ms).atZone(zone))
@@ -45,6 +46,26 @@ class Format(
         val d = localDate(ms)
         return if (d.year == localDate(nowMs).year) dateFmt.format(d) else dateYearFmt.format(d)
     }
+
+    /**
+     * When something is due: "Today 15:00", "Tomorrow 09:00", "Yesterday 18:07", the weekday
+     * within the coming week ("Thursday 09:00"), then "Thu 30 Oct, 09:00".
+     */
+    fun dayTime(ms: Long, nowMs: Long = System.currentTimeMillis()): String {
+        val d = localDate(ms)
+        val days = ChronoUnit.DAYS.between(localDate(nowMs), d)
+        val day = when (days) {
+            0L -> "Today"
+            1L -> "Tomorrow"
+            -1L -> "Yesterday"
+            in 2L..6L -> weekdayFmt.format(d)
+            else -> date(ms, nowMs) + ","
+        }
+        return "$day ${clock(ms)}"
+    }
+
+    /** ISO 8601 with the offset, to the second, as the receiver takes it: "2026-10-29T15:00:00-05:00". */
+    fun iso(ms: Long): String = isoFmt.format(Instant.ofEpochMilli(ms).atZone(zone))
 
     /** The title, or "Recording · 14:38" / "Command · 14:38" until the receiver has one. */
     fun title(e: Entry): String =

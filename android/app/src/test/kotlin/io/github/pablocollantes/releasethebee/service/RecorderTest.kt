@@ -7,7 +7,9 @@ import io.github.pablocollantes.releasethebee.sink.SessionInfo
 import io.github.pablocollantes.releasethebee.sink.SessionInfo.Kind
 import io.github.pablocollantes.releasethebee.sink.SessionInfo.Trigger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RecorderTest {
@@ -25,8 +27,12 @@ class RecorderTest {
             events += "start ${s.id} ${s.kind.wire} ${s.trigger?.wire} parent=${s.parentId}"
         }
         override fun audio(f: AudioFrame) { events += "audio ${f.seq}" }
-        override fun sessionEnd(s: SessionInfo, reason: String) { events += "end ${s.id} ($reason)" }
-        override fun setRecording(on: Boolean) { events += if (on) "unmute" else "mute" }
+        override fun sessionEnd(s: SessionInfo, reason: String, discard: Boolean) {
+            events += "end ${s.id} ($reason)" + if (discard) " discard" else ""
+        }
+        override fun setRecording(on: Boolean, temporary: Boolean) {
+            events += (if (on) "unmute" else "mute") + if (temporary) " temp" else ""
+        }
         override fun commandFeedback(start: Boolean, ledShows: Boolean) {
             events += "feedback ${if (start) "start" else "end"}${if (ledShows) "" else " blink"}"
         }
@@ -75,11 +81,11 @@ class RecorderTest {
 
     @Test fun `double press while muted unmutes for a command and mutes after`() {
         r.button(Button.DOUBLE_PRESS)
-        assertEquals(listOf("unmute"), take())
+        assertEquals(listOf("unmute temp"), take())
         r.streamStarted("dev")
         assertEquals(listOf("start s1 command double_press parent=null", "feedback start"), take())
         r.button(Button.DOUBLE_PRESS)
-        assertEquals(listOf("end s1 (double press)", "feedback end", "mute"), take())
+        assertEquals(listOf("end s1 (double press)", "feedback end", "mute temp"), take())
         r.streamEnded("muted from the app")
         assertEquals(emptyList<String>(), take())
     }
@@ -110,7 +116,7 @@ class RecorderTest {
         r.streamStarted("dev")
         r.button(Button.HOLD_END)
         assertEquals(
-            listOf("unmute", "start s1 command hold parent=null", "feedback start", "end s1 (hold released)", "feedback end", "mute"),
+            listOf("unmute temp", "start s1 command hold parent=null", "feedback start", "end s1 (hold released)", "feedback end", "mute temp"),
             take(),
         )
     }
@@ -118,7 +124,7 @@ class RecorderTest {
     @Test fun `a hold let go before the RTB started cancels the start`() {
         r.button(Button.HOLD_START)
         r.button(Button.HOLD_END)
-        assertEquals(listOf("unmute", "mute"), take())
+        assertEquals(listOf("unmute temp", "mute temp"), take())
     }
 
     @Test fun `muting during a nested command ends both, command first`() {
@@ -162,7 +168,43 @@ class RecorderTest {
         r.button(Button.DOUBLE_PRESS)
         now += 60_000
         r.streamStarted("dev")             // the user's own single press, much later
-        assertEquals(listOf("unmute", "start s1 summary button parent=null"), take())
+        assertEquals(listOf("unmute temp", "start s1 summary button parent=null"), take())
+    }
+
+    @Test fun `deleting a command inside a summary hands the audio back`() {
+        r.streamStarted("dev")
+        r.button(Button.DOUBLE_PRESS)
+        take()
+        assertEquals(listOf("s1", "s2"), r.live)
+        assertTrue(r.discard("s2"))
+        r.audio(frame(1))
+        assertEquals(listOf("end s2 (deleted) discard", "audio 1"), take())
+        assertEquals("s1", r.current?.id)
+        assertEquals(0, timers.size)
+    }
+
+    @Test fun `deleting the summary keeps its command and mutes the RTB`() {
+        r.streamStarted("dev")
+        r.button(Button.DOUBLE_PRESS)
+        take()
+        assertTrue(r.discard("s1"))
+        assertEquals(
+            listOf("end s2 (its recording was deleted)", "feedback end", "end s1 (deleted) discard", "mute"),
+            take(),
+        )
+        assertNull(r.current)
+        r.streamEnded("muted from the app")
+        assertEquals(emptyList<String>(), take())
+    }
+
+    @Test fun `deleting a command from a muted RTB mutes it again`() {
+        r.button(Button.DOUBLE_PRESS)
+        r.streamStarted("dev")
+        take()
+        assertTrue(r.discard("s1"))
+        assertEquals(listOf("end s1 (deleted) discard", "mute temp"), take())
+        assertFalse(r.discard("s1"))
+        assertEquals(emptyList<String>(), r.live)
     }
 
     @Test fun `trigger wire names match the stream protocol`() {

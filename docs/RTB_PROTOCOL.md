@@ -147,8 +147,11 @@ any meaning. A hold reports its release, which makes push-to-talk possible.
 
 There is no command to light the LED by itself. An app can still flash it by flipping
 the recording state for a moment (`06 C0 00`, then `06 C0 01`): the audio in between is
-lost, and the state events this causes are the app's own. Release the Bee does this, when
-asked, for a command recorded inside a summary.
+lost, and the state events this causes are the app's own. Flips less than about half a
+second apart get swallowed: the LED doesn't change. So does a flip sent right after the
+change that unmuted the RTB. Release the Bee does this, when asked, when a command starts
+(after a short wait if it just unmuted the RTB for it), and twice when a command inside a
+summary ends.
 
 The RTB can also mute and resume itself (its button, or its own logic) and reports it
 with event `0xA003`. Observed on hardware: after a 64-second self-mute, audio after the

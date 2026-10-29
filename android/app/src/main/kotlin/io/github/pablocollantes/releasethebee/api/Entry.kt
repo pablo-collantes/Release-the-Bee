@@ -58,9 +58,17 @@ data class Entry(
 
     /**
      * [action] is CREATE_NOTE, ADD_TO_NOTE, CREATE_REMINDER or UNKNOWN. [note] is the target
-     * note's title, [whenIso] ISO 8601 with offset (reminders), [text] the body.
+     * note's title, [whenIso] ISO 8601 with offset (reminders), [text] the body. [done] is the
+     * user's: a reminder checked off.
      */
-    class Command(val action: String, val note: String?, val text: String?, val whenIso: String?, val model: String?)
+    data class Command(
+        val action: String,
+        val note: String?,
+        val text: String?,
+        val whenIso: String?,
+        val model: String?,
+        val done: Boolean = false,
+    )
 
     class Audio(val bytes: Long?, val mime: String?)
 
@@ -68,8 +76,11 @@ data class Entry(
     val hasAudio get() = endedAt != null || status != Status.RECORDING
 }
 
-/** A list response: the entries, and the server clock to pass as `since` next time. */
-class EntryPage(val entries: List<Entry>, val now: Long?)
+/**
+ * A list response: the entries, the server clock to pass as `since` next time, and (for a
+ * `since` request) the ids deleted since then.
+ */
+class EntryPage(val entries: List<Entry>, val now: Long?, val deleted: List<String> = emptyList())
 
 /** Parsing of the receiver's JSON. Tolerant: unknown fields are ignored, missing ones are null. */
 object EntryJson {
@@ -78,7 +89,7 @@ object EntryJson {
         val o = JSONObject(text)
         val arr = o.optJSONArray("entries") ?: JSONArray()
         val list = (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let { runCatching { entry(it) }.getOrNull() } }
-        return EntryPage(list, o.long("now"))
+        return EntryPage(list, o.long("now"), o.strings("deleted"))
     }
 
     fun entry(text: String): Entry = entry(JSONObject(text))
@@ -116,11 +127,46 @@ object EntryJson {
                 Entry.Summary(s.str("title"), s.str("summary"), s.strings("action_items"), s.str("model"))
             },
             command = o.obj("command")?.let { c ->
-                Entry.Command(c.str("action") ?: "UNKNOWN", c.str("note"), c.str("text"), c.str("when"), c.str("model"))
+                Entry.Command(
+                    c.str("action") ?: "UNKNOWN", c.str("note"), c.str("text"), c.str("when"), c.str("model"),
+                    done = c.optBoolean("done", false),
+                )
             },
             audio = o.obj("audio")?.let { a -> Entry.Audio(a.long("bytes"), a.str("mime")) },
         )
     }
+
+    /**
+     * The list form of [e] (no transcript or summary), as the receiver sends it: what the
+     * app keeps on disk between runs. [entry] reads it back.
+     */
+    fun light(e: Entry): JSONObject = JSONObject()
+        .put("id", e.id)
+        .put("device", e.device.orNull())
+        .put("kind", e.kind.wire)
+        .put("parent", e.parent.orNull())
+        .put("trigger", e.trigger.orNull())
+        .put("started_at", e.startedAt)
+        .put("ended_at", e.endedAt.orNull())
+        .put("duration_s", e.durationS.orNull())
+        .put("status", e.status.wire.ifEmpty { "processing" })
+        .put("error", e.error.orNull())
+        .put("title", e.title.orNull())
+        .put("preview", e.preview.orNull())
+        .put("speakers", e.speakers.orNull())
+        .put("command", e.command?.let { command(it) }.orNull())
+        .put("audio", e.audio?.let { JSONObject().put("bytes", it.bytes.orNull()).put("mime", it.mime.orNull()) }.orNull())
+
+    fun command(c: Entry.Command): JSONObject = JSONObject()
+        .put("action", c.action)
+        .put("note", c.note.orNull())
+        .put("text", c.text.orNull())
+        .put("when", c.whenIso.orNull())
+        .put("model", c.model.orNull())
+        .put("done", c.done)
+
+    /** JSON null: org.json drops a key put with Kotlin null. */
+    private fun Any?.orNull(): Any = this ?: JSONObject.NULL
 
     // org.json differs between Android and the reference library on JSON null
     // (optString gives "null" on Android), so every read goes through isNull first.

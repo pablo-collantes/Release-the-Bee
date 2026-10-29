@@ -37,11 +37,10 @@ object StreamProtocol {
         "parent" to s.parentId,
     )
 
-    fun sessionEnd(s: SessionInfo, reason: String) = json(
-        "type" to "session_end",
-        "session" to s.id,
-        "reason" to reason,
-    )
+    /** [discard]: the user deleted it; the receiver throws it away instead of processing it. */
+    fun sessionEnd(s: SessionInfo, reason: String, discard: Boolean = false) =
+        if (discard) json("type" to "session_end", "session" to s.id, "reason" to reason, "discard" to true)
+        else json("type" to "session_end", "session" to s.id, "reason" to reason)
 
     /**
      * A text message from the receiver. Only `entry` pushes mean anything to the app
