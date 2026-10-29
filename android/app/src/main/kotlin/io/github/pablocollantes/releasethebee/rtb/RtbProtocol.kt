@@ -20,6 +20,7 @@ object RtbProtocol {
 
     const val OP_SET_DEVICE_STATE = 0xC006
     const val OP_GET_DEVICE_ID = 0xC00E
+    const val OP_GET_BATTERY = 0xC00F
     const val OP_SET_BRIGHTNESS = 0xC016
     const val OP_GET_BRIGHTNESS = 0xC017
     const val OP_SET_ENCRYPTION_KEY = 0xC018
@@ -54,6 +55,7 @@ object RtbProtocol {
     fun setDeviceState(state: Int) = request(OP_SET_DEVICE_STATE, byteArrayOf(state.toByte()))
     fun setBrightness(level: Int) = request(OP_SET_BRIGHTNESS, byteArrayOf(LED_CHANNEL, level.coerceIn(0, 100).toByte()))
     fun getBrightness() = request(OP_GET_BRIGHTNESS, byteArrayOf(LED_CHANNEL))
+    fun getBattery() = request(OP_GET_BATTERY)
 
     fun parse(d: ByteArray): Reply {
         if (d.size < 2) return Reply.Unknown(d)
@@ -87,6 +89,20 @@ sealed interface Reply {
     data object KeyAlreadySet : Reply
     class Event(val tag: Int, val payload: ByteArray) : Reply
     class Unknown(val raw: ByteArray) : Reply
+}
+
+/**
+ * Reply to GetBatteryAndChargeState: `[level %][charging flag]`, e.g. `28 00` = 40%, not
+ * charging (seen on a real RTB). The battery (0xA004) and charging (0xA005) events carry
+ * one byte each, in the same order. A first byte over 100 isn't a level.
+ */
+class BatteryState(val level: Int, val charging: Boolean?) {
+    companion object {
+        fun parse(payload: ByteArray): BatteryState? {
+            val level = payload.firstOrNull()?.toInt()?.and(0xFF)?.takeIf { it <= 100 } ?: return null
+            return BatteryState(level, payload.getOrNull(1)?.let { it.toInt() != 0 })
+        }
+    }
 }
 
 /** Reply to GetSecureIds: `[deviceId 8][sealed flag]`. */

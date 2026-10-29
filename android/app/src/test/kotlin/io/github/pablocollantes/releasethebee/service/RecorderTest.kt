@@ -16,7 +16,7 @@ class RecorderTest {
 
     private var now = 1_000_000L
     private var ids = 0
-    private var config = Recorder.Config()
+    private var config = Recorder.Config(minCommandMs = 0)      // the short-command rule has its own tests
     private val events = mutableListOf<String>()
     private val sessions = mutableListOf<SessionInfo>()
     private val timers = mutableListOf<Pair<Long, () -> Unit>>()
@@ -141,7 +141,7 @@ class RecorderTest {
     }
 
     @Test fun `unmute can record commands, and double press summaries`() {
-        config = Recorder.Config(unmute = Kind.COMMAND, doublePress = Action.SUMMARY)
+        config = config.copy(unmute = Kind.COMMAND, doublePress = Action.SUMMARY)
         r.streamStarted("dev")
         assertEquals(listOf("start s1 command button parent=null", "feedback start"), take())
         r.streamEnded("RTB stopped recording")
@@ -155,7 +155,7 @@ class RecorderTest {
     }
 
     @Test fun `gestures set to nothing do nothing`() {
-        config = Recorder.Config(doublePress = Action.NOTHING, hold = Action.NOTHING)
+        config = config.copy(doublePress = Action.NOTHING, hold = Action.NOTHING)
         r.streamStarted("dev")
         take()
         r.button(Button.DOUBLE_PRESS)
@@ -209,5 +209,38 @@ class RecorderTest {
 
     @Test fun `trigger wire names match the stream protocol`() {
         assertEquals(listOf("button", "double_press", "hold", "app"), Trigger.entries.map { it.wire })
+    }
+
+    @Test fun `a hold let go within a second was a press, not a command`() {
+        config = config.copy(minCommandMs = 1_000)
+        r.button(Button.HOLD_START)
+        r.streamStarted("dev")
+        assertTrue(r.commandOpen)
+        now += 300
+        r.button(Button.HOLD_END)
+        assertEquals(
+            listOf("unmute temp", "start s1 command hold parent=null", "feedback start", "end s1 (too short) discard", "mute temp"),
+            take(),
+        )
+        assertFalse(r.commandOpen)
+    }
+
+    @Test fun `a command of a second or more is kept`() {
+        config = config.copy(minCommandMs = 1_000)
+        r.button(Button.HOLD_START)
+        r.streamStarted("dev")
+        now += 1_000
+        r.button(Button.HOLD_END)
+        assertEquals(
+            listOf("unmute temp", "start s1 command hold parent=null", "feedback start", "end s1 (hold released)", "feedback end", "mute temp"),
+            take(),
+        )
+    }
+
+    @Test fun `a short summary is still a summary`() {
+        config = config.copy(minCommandMs = 1_000)
+        r.streamStarted("dev")
+        r.streamEnded("RTB stopped recording")
+        assertEquals(listOf("start s1 summary button parent=null", "end s1 (RTB stopped recording)"), take())
     }
 }

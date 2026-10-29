@@ -59,4 +59,16 @@ class RtbProtocolTest {
         assertTrue(RtbProtocol.parse(bytes(0x01)) is Reply.Unknown)
         assertTrue(RtbProtocol.parse(bytes(0x00, 0x80, 0x1B)) is Reply.Unknown)
     }
+
+    @Test fun `battery request and its reply`() {
+        assertArrayEquals(byteArrayOf(0x0F, 0xC0.toByte()), RtbProtocol.getBattery())
+        val ok = RtbProtocol.parse(byteArrayOf(0x00, 0x80.toByte(), 0x0F, 0xC0.toByte(), 0x32, 0x01)) as Reply.Ok
+        assertEquals(RtbProtocol.OP_GET_BATTERY, ok.op)
+        val b = BatteryState.parse(ok.payload)!!
+        assertEquals(50, b.level)
+        assertEquals(true, b.charging)
+        assertEquals(null, BatteryState.parse(byteArrayOf(0x32))!!.charging)
+        assertNull(BatteryState.parse(byteArrayOf(0xC8.toByte())))       // 200: not a level
+        assertNull(BatteryState.parse(ByteArray(0)))
+    }
 }

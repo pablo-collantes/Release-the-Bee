@@ -25,6 +25,7 @@ BODIES = ("transcript", "summary", "command")
 LEGACY_NAME = re.compile(r"^(\d{6})_([0-9A-Za-z]+)\.aac$")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DELETED_FILE = "deleted.json"
+WORDS_FILE = "words.json"
 TOMBSTONE_DAYS = 90
 FILES = (".aac", ".m4a", ".json", ".json.tmp", ".m4a.tmp")    # everything a recording leaves on disk
 
@@ -209,6 +210,25 @@ class EntryStore:
             if len(out) == limit:
                 break
         return out
+
+    def words(self):
+        """The user's word list (rtb_process.clean_words), oldest first."""
+        try:
+            with open(os.path.join(self.root, WORDS_FILE), encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return []
+        return rtb_process.clean_words(saved.get("words") if isinstance(saved, dict) else None)
+
+    def set_words(self, words):
+        """Replace the word list; returns it as kept."""
+        words = rtb_process.clean_words(words)
+        path = os.path.join(self.root, WORDS_FILE)
+        with self.lock:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"words": words}, f, ensure_ascii=False, indent=1)
+            os.replace(path + ".tmp", path)
+        return words
 
     def audio_file(self, id):
         """(path, mime) of the entry's audio: the M4A remux if it exists, else the raw AAC."""
@@ -402,11 +422,12 @@ class Worker(threading.Thread):
 
         rtb_process.log(f"processing {entry['kind']} {id}")
         notes = store.note_titles() if entry["kind"] == "command" else ()
+        words = store.words()
         try:
             if not os.path.exists(aac) or os.path.getsize(aac) == 0:
                 store.update(id, gen, status="done", duration_s=0, audio=None)
                 return
-            rtb_process.process(self.args, aac, entry, save, check, notes=notes)
+            rtb_process.process(self.args, aac, entry, save, check, notes=notes, words=words)
         except rtb_process.Cancelled:
             rtb_process.log(f"processing {id} cancelled (entry changed)")
         except Exception as e:

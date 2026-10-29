@@ -402,6 +402,8 @@ def route(method, target, headers, store, token, body=b"", rec=None):
     parts = [p for p in url.path.split("/") if p]
     if not parts:
         return json_response(426, {"error": "this is the WebSocket URL; the API is under /api/entries"})
+    if parts == ["api", "words"]:
+        return words_route(method, body, store)
     if parts[0] != "api" or len(parts) < 2 or parts[1] != "entries" or len(parts) > 4:
         return json_response(404, {"error": "not found"})
     if len(parts) == 2:
@@ -455,6 +457,22 @@ def route(method, target, headers, store, token, body=b"", rec=None):
             return json_response(409, {"error": "still recording"})
         return json_response(202, {"id": id, "status": "queued"})
     return json_response(404, {"error": "not found"})
+
+
+def words_route(method, body, store):
+    """GET the user's word list, or PUT a new one: {"words": ["Jev", "RTB", …]}."""
+    if method in ("GET", "HEAD"):
+        return json_response(200, {"words": store.words()})
+    if method != "PUT":
+        return json_response(405, {"error": "method not allowed"})
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return json_response(400, {"error": "body must be JSON"})
+    words = obj.get("words") if isinstance(obj, dict) else None
+    if not isinstance(words, list) or not all(isinstance(w, str) for w in words):
+        return json_response(400, {"error": 'body must be {"words": ["…", …]}'})
+    return json_response(200, {"words": store.set_words(words)})
 
 
 def command_changes(body):

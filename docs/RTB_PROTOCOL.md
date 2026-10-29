@@ -38,7 +38,7 @@ All opcodes are `0xC0nn`, so every request starts `nn C0`.
 | GetBitrate | 0xC009 | `09 C0` | |
 | GetDeviceState | 0xC00A | `0A C0` | |
 | GetDeviceID | 0xC00E | `0E C0` | |
-| GetBatteryAndChargeState | 0xC00F | `0F C0` | |
+| GetBatteryAndChargeState | 0xC00F | `0F C0` | reply `[level %][charging 0/1]`, e.g. `28 00` = 40%, not charging |
 | SetBrightness | 0xC016 | `16 C0` | `[01][brightness]` |
 | GetBrightness | 0xC017 | `17 C0` | |
 | **SetEncryptionKey** (seal) | 0xC018 | `18 C0` | the 108-byte seal token |
@@ -83,8 +83,8 @@ Notifications on the control characteristic start with a little-endian u16 tag:
 | `0xA001` | Event: button double-press | none. A triple press sends this too |
 | `0xA002` | Event: button hold | `01` when the hold starts, `00` on release |
 | `0xA003` | Event: device state changed | `[state][…]`: `01 01` recording, `00 01` muted |
-| `0xA004` | Event: battery level | |
-| `0xA005` | Event: charging | |
+| `0xA004` | Event: battery level | `[level %]`, e.g. `32` = 50%. Sent on its own when the level changes |
+| `0xA005` | Event: charging | `[0/1]` |
 
 OK payloads that matter:
 
@@ -139,11 +139,14 @@ Observed on hardware (firmware as of 2026-10):
 | Single press | toggles mute itself | `0xA003` with the new state |
 | Double press | nothing on its own | `0xA001` |
 | Triple press | same as a double press | `0xA001` (the third press is swallowed) |
-| Hold | nothing on its own | `0xA002 01` when the hold registers, `0xA002 00` on release |
+| Hold | records while held, mutes on release | `0xA002 01` when the hold registers (with `0xA003 01`), `0xA002 00` on release (then `0xA003 00`) |
 | 5 quick presses | factory reset: clears the seal | — |
 
-Double press and hold don't change the recording state, so an app is free to give them
-any meaning. A hold reports its release, which makes push-to-talk possible.
+A double press doesn't change the recording state, so an app is free to give it any
+meaning. A hold reports its release, which makes push-to-talk possible, but the RTB mutes
+itself on that release (seen from a muted RTB): an app that wants it recording after the
+hold has to unmute it again. A short press can register as a hold that ends within a
+second; Release the Bee throws commands that short away.
 
 There is no command to light the LED by itself. An app can still flash it by flipping
 the recording state for a moment (`06 C0 00`, then `06 C0 01`): the audio in between is

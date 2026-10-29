@@ -140,7 +140,7 @@ class EntryStoreTest(unittest.TestCase):
         self.queued(s, "c")
         runs = []
 
-        def process(args, aac, entry, save, check, notes=()):
+        def process(args, aac, entry, save, check, notes=(), words=()):
             runs.append(entry["id"])
             save(status="done", command={"action": "CREATE_NOTE", "note": f"Run {len(runs)}", "text": "x",
                                          "when": None, "model": "m"})
@@ -207,7 +207,7 @@ class EntryStoreTest(unittest.TestCase):
         stem = self.queued(s, "w", kind="summary")
         reached = []
 
-        def process(args, aac, entry, save, check, notes=()):
+        def process(args, aac, entry, save, check, notes=(), words=()):
             save(status="transcribing")
             s.delete("w")                                       # the user deletes it mid-run...
             with open(stem + ".m4a", "wb") as f:                # ...and then the remux lands
@@ -242,13 +242,14 @@ class EntryStoreTest(unittest.TestCase):
         self.queued(s, "talk", kind="summary")
         seen = {}
 
-        def process(args, aac, entry, save, check, notes=()):
-            seen[entry["id"]] = notes
+        def process(args, aac, entry, save, check, notes=(), words=()):
+            seen[entry["id"]] = notes, words
+        s.set_words(["Jev"])
         with mock.patch.object(rtb_process, "process", process):
             worker = rtb_entries.Worker(s, Args())
             worker.handle(*s.next_job(timeout=0))
             worker.handle(*s.next_job(timeout=0))
-        self.assertEqual(seen, {"new": ["Groceries"], "talk": ()})
+        self.assertEqual(seen, {"new": (["Groceries"], ["Jev"]), "talk": ((), ["Jev"])})
 
     def test_stale_worker_updates_are_dropped(self):
         s = self.store()

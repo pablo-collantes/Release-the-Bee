@@ -32,6 +32,11 @@ object AppStatus {
         val live: List<String> = emptyList(),
         /** The RTB's answer to the last request from the light tests. */
         val reply: String = "",
+        /** The RTB's battery in percent, as it last said (kept while it's away), and whether it's charging. */
+        val battery: Int? = null,
+        val charging: Boolean? = null,
+        /** When [battery] was last heard, for "as of" once the RTB is out of reach. */
+        val batteryAt: Long? = null,
     )
 
     private const val TAG = "releasethebee"

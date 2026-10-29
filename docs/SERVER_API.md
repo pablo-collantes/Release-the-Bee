@@ -87,6 +87,8 @@ token. Wrong or missing token → `401`.
 | `POST /api/entries/<id>/reprocess` | queue it again (after changing models). `202`, or `409` while it's still recording |
 | `PATCH /api/entries/<id>` | change a processed command (see below). `200` with the full entry |
 | `DELETE /api/entries/<id>` | delete the entry and its audio. `200` `{"id": "<id>", "deleted": true}`, also if it was already deleted. `404` if unknown |
+| `GET /api/words` | the user's word list: `{"words": ["Jev", "RTB", …]}`, oldest first |
+| `PUT /api/words` | replace it: body `{"words": [ … ]}`. `200` with the list as kept: trimmed, each once ignoring case, at most 100 of at most 40 characters. `400` if the body isn't that shape |
 
 The list response also carries `"now": <server ms>`, which the client passes as `since`
 next time.
@@ -155,8 +157,12 @@ if it was deleted.
 - **Transcription:** an HTTP whisper.cpp server (`--whisper-url`), or `whisper-cli`
   (`--whisper-cli` + `--whisper-model`), in requests of at most 10 minutes of speech,
   without conditioning on its own previous text (`max_context=0`, which stops
-  repetition loops). Leftover filler, loops, and text where diarization heard no voice
-  are dropped. Fragments of one sentence by one speaker are joined into one segment.
+  repetition loops). With a word list (`PUT /api/words`), whisper is primed with it
+  instead: the words are its initial prompt, carried into every 30-second window
+  (`carry_initial_prompt`), and `max_context` is sized to the prompt so little of its own
+  text comes back. A segment made only of those words (whisper reading the prompt back
+  over noise) is dropped. The summary and command prompts get the same words, spelled.
+  Leftover filler, loops, and text where diarization heard no voice are dropped. Fragments of one sentence by one speaker are joined into one segment.
 - **Summaries and commands:** any OpenAI-compatible chat endpoint (`--llm-url`,
   `--llm-model`): llama.cpp's `llama-server`, LM Studio, Ollama, vLLM. The default prompt
   is tuned for a small model (Gemma E4B). Output is constrained by a JSON schema where

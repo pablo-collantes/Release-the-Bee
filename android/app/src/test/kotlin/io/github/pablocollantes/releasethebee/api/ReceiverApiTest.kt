@@ -77,4 +77,18 @@ class ReceiverApiTest {
         assertEquals(401, assertThrows(ReceiverApi.HttpError::class.java) { api.entries() }.code)
         assertEquals(404, assertThrows(ReceiverApi.HttpError::class.java) { api.entry("nope") }.code)
     }
+
+    @Test fun `reads and replaces the word list`() {
+        server.enqueue(MockResponse().setBody("""{"words":["Jev","RTB"]}"""))
+        server.enqueue(MockResponse().setBody("""{"words":["Jev","RTB","Release the Bee"]}"""))
+        val api = ReceiverApi(base, "s3cret")
+        assertEquals(listOf("Jev", "RTB"), api.words())
+        assertEquals(listOf("Jev", "RTB", "Release the Bee"), api.putWords(listOf("Jev", "RTB", " Release the Bee")))
+        val get = server.takeRequest()
+        assertEquals("GET /api/words", "${get.method} ${get.path}")
+        val put = server.takeRequest()
+        assertEquals("PUT /api/words", "${put.method} ${put.path}")
+        assertEquals("Bearer s3cret", put.getHeader("Authorization"))
+        assertEquals("""{"words":["Jev","RTB"," Release the Bee"]}""", put.body.readUtf8())
+    }
 }

@@ -6,6 +6,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -54,6 +55,22 @@ class ReceiverApi(baseUrl: String, private val bearer: String?, private val clie
     fun patchCommand(id: String, fields: JSONObject): Entry {
         val body = JSONObject().put("command", fields).toString().toRequestBody(JSON)
         return EntryJson.entry(call(Request.Builder().url(entryUrl(id)).patch(body)))
+    }
+
+    /** The words whisper and the summaries are primed with, oldest first. */
+    fun words(): List<String> = wordList(get(wordsUrl()))
+
+    /** Replace the word list; returns it as the receiver kept it (trimmed, each once). */
+    fun putWords(words: List<String>): List<String> {
+        val body = JSONObject().put("words", JSONArray(words)).toString().toRequestBody(JSON)
+        return wordList(call(Request.Builder().url(wordsUrl()).put(body)))
+    }
+
+    private fun wordsUrl() = base.newBuilder().addPathSegments("api/words").build()
+
+    private fun wordList(json: String): List<String> {
+        val a = JSONObject(json).optJSONArray("words") ?: return emptyList()
+        return (0 until a.length()).mapNotNull { a.optString(it).takeIf(String::isNotBlank) }
     }
 
     /** The recording as M4A; supports Range, so a player can seek. Needs [authHeaders]. */

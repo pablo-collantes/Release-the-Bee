@@ -41,6 +41,8 @@ class Recorder(
         val doublePress: Action = Action.COMMAND,
         val hold: Action = Action.COMMAND,
         val commandMaxMs: Long = 30_000,
+        /** A command shorter than this was a press that read as a hold: thrown away, no feedback. */
+        val minCommandMs: Long = 1_000,
     )
 
     interface Output {
@@ -73,6 +75,9 @@ class Recorder(
 
     /** Where audio goes right now: the command inside a summary, or the outer recording. */
     val current: SessionInfo? @Synchronized get() = child ?: top
+
+    /** Whether a command is recording now. */
+    val commandOpen: Boolean @Synchronized get() = commandOpen() != null
 
     /** Ids of the recordings open now, outermost first. */
     val live: List<String> @Synchronized get() = listOfNotNull(top?.id, child?.id)
@@ -206,11 +211,14 @@ class Recorder(
         if (s === child) child = null
         if (s === top) top = null
         if (s === held) held = null
-        out.sessionEnd(s, reason, discard)
+        val blip = !discard && s.kind == Kind.COMMAND && clock() - s.startedAtMs < config().minCommandMs
+        if (blip) out.log("command ${s.id.take(8)} lasted under ${config().minCommandMs} ms: a press, not a command; not kept")
+        out.sessionEnd(s, if (blip) "too short" else reason, discard || blip)
         if (s.kind == Kind.COMMAND) {
             cancelTimer?.invoke()
             cancelTimer = null
-            if (!discard) out.commandFeedback(start = false, ledShows = ledShows)   // deleted on the phone: no buzz
+            // Deleted on the phone, or nothing said: no buzz.
+            if (!discard && !blip) out.commandFeedback(start = false, ledShows = ledShows)
         }
     }
 

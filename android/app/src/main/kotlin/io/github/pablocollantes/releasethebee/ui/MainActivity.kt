@@ -25,6 +25,7 @@ import io.github.pablocollantes.releasethebee.store.Settings
  * - **Home**: the RTB and receiver at a glance, reminders coming up, the way to Notes, and
  *   the latest summaries.
  * - **Summaries**: every recording, newest first. Long press selects; then delete.
+ * - **Notes**: what you said into each note, by title.
  * - **To-do**: reminders as a checklist.
  *
  * It never polls. [Library] fetches when the app opens and when the receiver pushes a
@@ -35,6 +36,7 @@ class MainActivity : Activity() {
     enum class Tab(val title: String, val label: String, val icon: Int) {
         HOME("Release the Bee", "Home", R.drawable.ic_home),
         SUMMARIES("Summaries", "Summaries", R.drawable.ic_summaries),
+        NOTES("Notes", "Notes", R.drawable.ic_notes),
         TODO("To-do", "To-do", R.drawable.ic_todo),
     }
 
@@ -49,6 +51,7 @@ class MainActivity : Activity() {
 
     private lateinit var home: HomeTab
     private lateinit var summaries: SummariesTab
+    private lateinit var notes: NotesTab
     private lateinit var todo: TodoTab
     private var tab = Tab.HOME
 
@@ -82,6 +85,7 @@ class MainActivity : Activity() {
         Library.load(this)
         home = HomeTab(this)
         summaries = SummariesTab(this)
+        notes = NotesTab(this)
         todo = TodoTab(this)
         setContentView(buildUi())
         show(tabOf(intent) ?: (savedInstanceState?.getString(KEY_TAB)?.let { runCatching { Tab.valueOf(it) }.getOrNull() } ?: Tab.HOME))
@@ -142,7 +146,7 @@ class MainActivity : Activity() {
 
     fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
 
-    fun openNotes() = startActivity(Intent(this, NotesActivity::class.java))
+    fun openNotes() = show(Tab.NOTES)
 
     /** The selection in Summaries changed: swap the bar for the selection's own. */
     fun selectionChanged(count: Int) {
@@ -154,6 +158,7 @@ class MainActivity : Activity() {
     private fun renderAll() {
         home.render()
         summaries.render()
+        notes.render()
         todo.render()
     }
 
@@ -182,6 +187,7 @@ class MainActivity : Activity() {
         val content = FrameLayout(this)
         pages[Tab.HOME] = home.view
         pages[Tab.SUMMARIES] = summaries.view
+        pages[Tab.NOTES] = notes.view
         pages[Tab.TODO] = todo.view
         pages.values.forEach { content.addView(it, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)) }
 

@@ -30,6 +30,9 @@ class HomeTab(private val host: MainActivity) {
     private val rtbDot = ui.dot(ui.gray, 10)
     private val rtbText = ui.text(16f, bold = true).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
     private val rtbSince = ui.text(13f, ui.fgMuted)
+    private val battery = BatteryView(host, ui)
+    private val batteryText = ui.text(13f, ui.fgMuted)
+    private val batteryRow = ui.row(battery, batteryText.apply { setPadding(ui.dp(6), 0, 0, 0) }).apply { visibility = View.GONE }
     private val receiverDot = ui.dot(ui.gray, 10)
     private val receiverText = ui.text(14f, ui.fgMuted).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
     private val statusDetail = ui.text(13f, ui.fgMuted).apply { visibility = View.GONE }
@@ -109,6 +112,7 @@ class HomeTab(private val host: MainActivity) {
         ui.setDot(rtbDot, rtbColor)
         val started = st.sessionStartedAt
         rtbSince.text = if (st.link == RtbLink.State.STREAMING && started != null) "since ${fmt.clock(started)}" else ""
+        renderBattery(st)
 
         val (receiver, receiverColor) = receiverState(st)
         receiverText.text = receiver
@@ -123,6 +127,23 @@ class HomeTab(private val host: MainActivity) {
         statusDetail.text = detail
         statusDetail.setTextColor(if (st.link == RtbLink.State.FAILED) ui.red else ui.fgMuted)
         statusDetail.visibility = if (detail.isBlank()) View.GONE else View.VISIBLE
+    }
+
+    /** The RTB's battery, as it last said. Out of reach, that's a while ago: say when. */
+    private fun renderBattery(st: AppStatus.Snapshot) {
+        val level = st.battery
+        batteryRow.visibility = if (level == null) View.GONE else View.VISIBLE
+        if (level == null) return
+        val charging = st.charging == true
+        battery.set(level, charging)
+        val connected = st.link in listOf(RtbLink.State.STREAMING, RtbLink.State.MUTED, RtbLink.State.PAUSED)
+        val at = st.batteryAt
+        batteryText.text = when {
+            charging -> "$level% · charging"
+            !connected && at != null -> "$level% at ${fmt.clock(at)}"
+            else -> "$level%"
+        }
+        batteryText.setTextColor(if (level <= 15 && !charging) ui.red else ui.fgMuted)
     }
 
     private fun receiverState(st: AppStatus.Snapshot): Pair<String, Int> {
@@ -157,7 +178,7 @@ class HomeTab(private val host: MainActivity) {
 
         // Status: tap for Settings.
         val lines = ui.column(
-            ui.row(rtbDot, rtbText.withStart(10, weight = 1f), rtbSince.withStart(8)),
+            ui.row(rtbDot, rtbText.withStart(10, weight = 1f), rtbSince.withStart(8), batteryRow.withStart(10)),
             ui.row(receiverDot, receiverText.withStart(10, weight = 1f)).apply { setPadding(0, ui.dp(6), 0, 0) },
             statusDetail.apply { setPadding(ui.dp(20), ui.dp(6), 0, 0) },
         )
@@ -223,7 +244,7 @@ class HomeTab(private val host: MainActivity) {
 
     private fun full(top: Int = 0) = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = ui.dp(top) }
 
-    private fun TextView.withStart(marginDp: Int, weight: Float = 0f): View = apply {
+    private fun View.withStart(marginDp: Int, weight: Float = 0f): View = apply {
         layoutParams = LinearLayout.LayoutParams(if (weight > 0f) 0 else WRAP_CONTENT, WRAP_CONTENT, weight).apply {
             marginStart = ui.dp(marginDp)
         }

@@ -204,6 +204,60 @@ class CommandPromptTest(unittest.TestCase):
         self.assertEqual(system, self.command([])[0])
 
 
+class WordsTest(unittest.TestCase):
+    def test_clean_words(self):
+        self.assertEqual(p.clean_words([" Jev", "jev", 3, "", "x" * 41, "Release\nthe  Bee"]), ["Jev", "Release the Bee"])
+        self.assertEqual(p.clean_words("Jev"), [])
+        self.assertEqual(len(p.clean_words([f"w{i}" for i in range(150)])), p.MAX_WORDS)
+
+    def test_whisper_is_primed_with_the_words(self):
+        sent = []
+
+        class Res:
+            def read(self):
+                return b'{"segments": [], "language": "english"}'
+
+        def urlopen(req, timeout):
+            sent.append(req.data)
+            return Res()
+
+        args = Args(whisper_url="http://w")
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f, mock.patch.object(p.urllib.request, "urlopen", urlopen):
+            p.whisper_server(args, f.name, "en", p.word_prompt(["Jev", "RTB"]))
+            p.whisper_server(args, f.name, "en")
+        primed, plain = sent[0].decode("latin-1"), sent[1].decode("latin-1")
+        self.assertIn('name="prompt"\r\n\r\nJev, RTB.\r\n', primed)
+        self.assertIn('name="carry_initial_prompt"\r\n\r\ntrue', primed)
+        ctx = int(primed.split('name="max_context"\r\n\r\n')[1].split("\r\n")[0])
+        self.assertTrue(6 <= ctx <= 24, ctx)                    # about the prompt: no long rolling context
+        self.assertNotIn('name="prompt"', plain)
+        self.assertIn('name="max_context"\r\n\r\n0\r\n', plain)
+
+    def test_prompt_context_is_capped(self):
+        self.assertEqual(p.prompt_context(p.word_prompt([f"Word{i}" for i in range(100)])), 224)
+
+    def test_prompt_echoes_are_dropped(self):
+        words = ["Jev", "RTB", "Release the Bee"]
+        segs = [seg(0, 2, "Jev, RTB, Release the Bee."), seg(2, 4, "Ask Jev about it."), seg(4, 5, "Jev."),
+                seg(5, 6, "RTB, Jev.")]
+        self.assertEqual([s["text"] for s in p.drop_prompt_echoes(segs, words)], ["Ask Jev about it.", "Jev."])
+        self.assertEqual(p.drop_prompt_echoes(segs, ()), segs)
+
+    def test_words_reach_the_llm(self):
+        prompts = []
+
+        def chat_json(args, system, user, schema, max_tokens=1200):
+            prompts.append(system)
+            return {"title": "T", "summary": "S", "action_items": [], "action": "UNKNOWN"}, "m"
+        with mock.patch.object(p, "chat_json", chat_json):
+            p.summarize(Args(), [seg(0, 2, "We talked about Jeff.")], lambda: None, ["Jev", "RTB"])
+            p.command(Args(), [seg(0, 2, "Ask Jeff.")], 1761651534000, lambda: None, (), ["Jev"])
+            p.summarize(Args(), [seg(0, 2, "Hi.")], lambda: None)
+        self.assertTrue(prompts[0].endswith("write it exactly like this:\nJev, RTB"))
+        self.assertIn("write it exactly like this:\nJev", prompts[1])
+        self.assertNotIn("write it exactly", prompts[2])
+
+
 class AdtsTest(unittest.TestCase):
     def test_duration_and_resync(self):
         with tempfile.NamedTemporaryFile(suffix=".aac", delete=False) as f:

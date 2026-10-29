@@ -55,14 +55,9 @@
             android:parentActivityName=".ui.MainActivity" />
 
         <activity
-            android:name=".ui.NotesActivity"
-            android:exported="false"
-            android:parentActivityName=".ui.MainActivity" />
-
-        <activity
             android:name=".ui.NoteActivity"
             android:exported="false"
-            android:parentActivityName=".ui.NotesActivity" />
+            android:parentActivityName=".ui.MainActivity" />
 
         <activity
             android:name=".ui.SettingsActivity"

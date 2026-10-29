@@ -225,11 +225,51 @@ WHISPER_FIELDS = {
 }
 
 
-def whisper_server(args, wav_path, language):
+# --------------------------------------------------------------------------- words
+
+MAX_WORDS = 100
+MAX_WORD_LEN = 40
+
+
+def clean_words(words):
+    """The user's word list, tidied: trimmed, inner spaces collapsed, each once (ignoring
+    case), at most MAX_WORDS of at most MAX_WORD_LEN characters. Anything else is dropped."""
+    out, seen = [], set()
+    for w in words if isinstance(words, (list, tuple)) else ():
+        if not isinstance(w, str):
+            continue
+        w = " ".join(w.split())
+        if not w or len(w) > MAX_WORD_LEN or w.casefold() in seen:
+            continue
+        seen.add(w.casefold())
+        out.append(w)
+        if len(out) == MAX_WORDS:
+            break
+    return out
+
+
+def word_prompt(words):
+    """Whisper's initial prompt: the words as a list. Whisper spells what it reads there."""
+    return ", ".join(words) + "." if words else ""
+
+
+def prompt_context(prompt):
+    """max_context for a request with this prompt. Whisper only reads a prompt with text
+    context on, and its own earlier text is what loops on bad audio (see WHISPER_FIELDS),
+    so the context is about the prompt's size: a high estimate of its tokens (rare words
+    take ~1 token per 2-3 characters), and whisper's cap of 224. Over the real count, the
+    rest goes to the last window's text; under it, whisper drops the prompt's first words."""
+    est = sum(-(-len(w) * 2 // 5) + 1 for w in prompt.split()) + 2
+    return min(224, est)
+
+
+def whisper_server(args, wav_path, language, prompt=""):
     url = args.whisper_url.rstrip("/")
     if not url.endswith("/inference"):
         url += "/inference"
     fields = dict(WHISPER_FIELDS, language=language)
+    if prompt:
+        fields.update(prompt=prompt, carry_initial_prompt="true", max_context=str(prompt_context(prompt)))
     body, ctype = _multipart(fields, open(wav_path, "rb").read())
     req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype})
     res = _retry(lambda: json.load(urllib.request.urlopen(req, timeout=1800)), "whisper")
@@ -239,10 +279,11 @@ def whisper_server(args, wav_path, language):
     return segs, _lang_code(res.get("language"))
 
 
-def whisper_cli(args, wav_path, language):
+def whisper_cli(args, wav_path, language, prompt=""):
     base = wav_path[:-4]
+    mc = ["-mc", str(prompt_context(prompt)), "--prompt", prompt, "--carry-initial-prompt"] if prompt else ["-mc", "0"]
     cmd = [args.whisper_cli, "-m", args.whisper_model, "-f", wav_path, "-oj", "-of", base, "-np",
-           "-l", language, "-mc", "0", "-sns", "-nth", "0.6", "-lpt", "-1.0", "-sow"]
+           "-l", language, *mc, "-sns", "-nth", "0.6", "-lpt", "-1.0", "-sow"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"whisper-cli failed: {r.stderr.strip()[-300:]}")
@@ -275,9 +316,11 @@ def _lang_code(lang):
     return _LANGS.get(lang.lower(), lang.lower())
 
 
-def transcribe(args, norm_wav, regions, total_s, check):
-    """Whisper over the speech regions (or everything), in requests of at most CHUNK_S.
-    Returns (segments, language) with times in the original recording."""
+def transcribe(args, norm_wav, regions, total_s, check, words=()):
+    """Whisper over the speech regions (or everything), in requests of at most CHUNK_S,
+    primed with the user's words. Returns (segments, language) with times in the
+    original recording."""
+    prompt = word_prompt(words)
     pcm = read_wav(norm_wav)
     run = whisper_server if args.whisper_url else whisper_cli
     language = args.language or "auto"
@@ -290,7 +333,7 @@ def transcribe(args, norm_wav, regions, total_s, check):
             continue
         path = os.path.join(tmp, f"chunk{n}.wav")
         write_wav(path, part)
-        segs, lang = run(args, path, language)
+        segs, lang = run(args, path, language, prompt)
         os.remove(path)
         if language == "auto" and lang:
             language = detected = lang             # keep later chunks in the first chunk's language
@@ -302,7 +345,7 @@ def transcribe(args, norm_wav, regions, total_s, check):
                 end = s["start"] + (b - a)
             s["end"] = round(max(s["start"], end), 2)
             out.append(s)
-    return clean_segments(out), detected or (None if language == "auto" else language)
+    return drop_prompt_echoes(clean_segments(out), words), detected or (None if language == "auto" else language)
 
 
 # What whisper says over silence and noise (it learned these from subtitles).
@@ -338,6 +381,22 @@ def clean_segments(segs):
         text = _collapse_repeats(text)
         out.append({"start": s["start"], "end": s["end"], "text": text})
     return _drop_loops(out)
+
+
+def drop_prompt_echoes(segs, words):
+    """Over noise, a primed whisper can read its prompt back: a segment made only of two or
+    more of the user's words ("Jev, RTB.") is that, not speech."""
+    vocab = {t for w in words for t in re.findall(r"[\w']+", w.casefold())}
+    if not vocab:
+        return segs
+    out = []
+    for s in segs:
+        tokens = re.findall(r"[\w']+", s["text"].casefold())
+        hits = {w.casefold() for w in words if w.casefold() in s["text"].casefold()}
+        if tokens and len(hits) >= 2 and all(t in vocab for t in tokens):
+            continue
+        out.append(s)
+    return out
 
 
 def _drop_loops(segs, max_period=4):
@@ -571,6 +630,18 @@ Examples:
 "Remind me in two hours to move the car." → \
 {{"action": "CREATE_REMINDER", "note": null, "text": "Move the car", "date": null, "time": null, "in_minutes": 120}}"""
 
+# Appended when the user has a word list: the transcript may have them misheard.
+WORDS_SECTION = """
+
+Words the user says (names, products, jargon). The transcript may have them misheard as \
+similar-sounding words; when one is meant, write it exactly like this:
+"""
+
+
+def with_words(system, words):
+    return system + WORDS_SECTION + ", ".join(words) if words else system
+
+
 # Appended when the user has notes, so ADD_TO_NOTE names one the phone can find.
 NOTES_SECTION = """
 
@@ -707,12 +778,12 @@ def split_lines(text, budget):
     return parts
 
 
-def summarize(args, segments, check):
+def summarize(args, segments, check, words=()):
     text = transcript_text(segments)
     room = args.llm_context - 2500                           # prompt + answer
     budget = min(args.llm_chunk, room) if args.llm_chunk > 0 else room
     if est_tokens(text) <= budget:
-        out, model = chat_json(args, SUMMARY_PROMPT, "Transcript:\n" + text, SUMMARY_SCHEMA)
+        out, model = chat_json(args, with_words(SUMMARY_PROMPT, words), "Transcript:\n" + text, SUMMARY_SCHEMA)
     else:
         # Too long for one request: notes per part, then one summary of the notes.
         parts = split_lines(text, budget)
@@ -720,7 +791,7 @@ def summarize(args, segments, check):
         for i, part in enumerate(parts, 1):
             check()
             log(f"summary: part {i}/{len(parts)}")
-            res, model = chat_json(args, NOTES_PROMPT, f"Part {i} of {len(parts)}:\n{part}", NOTES_SCHEMA)
+            res, model = chat_json(args, with_words(NOTES_PROMPT, words), f"Part {i} of {len(parts)}:\n{part}", NOTES_SCHEMA)
             notes.append(f"Part {i}:\n" + "\n".join(f"- {n}" for n in _strings(res.get("notes"))))
             actions += _strings(res.get("action_items"))
         merged = "\n\n".join(notes)
@@ -729,7 +800,7 @@ def summarize(args, segments, check):
         while est_tokens(merged) > room:                    # absurdly long: keep the newest notes
             merged = merged[len(merged) // 4:]
         check()
-        out, model = chat_json(args, MERGE_PROMPT, merged, SUMMARY_SCHEMA, max_tokens=1500)
+        out, model = chat_json(args, with_words(MERGE_PROMPT, words), merged, SUMMARY_SCHEMA, max_tokens=1500)
     return {
         "title": str(out.get("title") or "").strip().strip('"') or None,
         "summary": str(out.get("summary") or "").strip(),
@@ -742,9 +813,9 @@ def _strings(v):
     return [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else []
 
 
-def command(args, segments, started_at_ms, check, notes=()):
+def command(args, segments, started_at_ms, check, notes=(), words=()):
     """One action from a command's transcript. notes: titles of the user's existing
-    notes, newest first."""
+    notes, newest first; words: the user's word list."""
     spoken = datetime.datetime.fromtimestamp(started_at_ms / 1000).astimezone()
     # One week only: listing two made Gemma E4B pick the later Monday for "next Monday".
     days = [spoken + datetime.timedelta(days=i) for i in range(8)]
@@ -752,6 +823,7 @@ def command(args, segments, started_at_ms, check, notes=()):
                          for i, d in enumerate(days))
     system = COMMAND_PROMPT.format(now=f"{spoken:%A %Y-%m-%d %H:%M} ({spoken.tzname()}, UTC{spoken:%z})",
                                    calendar=calendar, tomorrow=f"{days[1]:%Y-%m-%d}")
+    system = with_words(system, words)
     if notes:
         system += NOTES_SECTION + "\n".join(" ".join(n.split()) for n in notes)
     text = " ".join(s["text"] for s in segments)
@@ -819,11 +891,12 @@ def preview_of(markdown):
 
 # --------------------------------------------------------------------------- the pipeline
 
-def process(args, aac, entry, save, check=lambda: None, notes=()):
+def process(args, aac, entry, save, check=lambda: None, notes=(), words=()):
     """Process one recording. save(**fields) stores results and status as each step
     finishes, so a failure later on keeps what was done; check() is called between
     requests and raises Cancelled to stop. notes: titles of the user's notes, for a
-    command. Returns per-step timings in seconds."""
+    command; words: the user's word list, for whisper and the LLM. Returns per-step
+    timings in seconds."""
     have = tools(args)
     stem = aac[:-4]
     timings = {}
@@ -861,7 +934,7 @@ def process(args, aac, entry, save, check=lambda: None, notes=()):
             # text, and pyannote finds quiet far-field speech that silero VAD missed
             # (tested on real recordings from the wearable).
             regions = [(a, b) for a, b, _ in turns] if turns is not None else None
-            segments, language = transcribe(args, norm, regions, total, check)
+            segments, language = transcribe(args, norm, regions, total, check, words)
             timings["whisper"] = round(time.time() - t, 1)
             if turns is not None:
                 segments, speakers = assign_speakers(segments, turns)
@@ -879,11 +952,11 @@ def process(args, aac, entry, save, check=lambda: None, notes=()):
         fields = {}
         t = time.time()
         if entry.get("kind") == "command":
-            cmd = command(args, segments, entry.get("started_at") or time.time() * 1000, check, notes)
+            cmd = command(args, segments, entry.get("started_at") or time.time() * 1000, check, notes, words)
             fields.update(command=cmd, summary=None, title=command_title(cmd),
                           preview=preview_of(cmd["text"] + (f" ({cmd['when']})" if cmd["when"] else "")))
         else:
-            summ = summarize(args, segments, check)
+            summ = summarize(args, segments, check, words)
             fields.update(summary=summ, command=None, title=summ["title"], preview=preview_of(summ["summary"]))
         timings["llm"] = round(time.time() - t, 1)
     elif segments:

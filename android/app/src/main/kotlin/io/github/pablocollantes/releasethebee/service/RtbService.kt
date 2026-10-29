@@ -300,6 +300,16 @@ class RtbService : Service(), RtbLink.Listener {
         settings.rtbRecording = on
     }
 
+    override fun onBattery(level: Int?, charging: Boolean?) {
+        val was = AppStatus.snapshot
+        AppStatus.update {
+            it.copy(battery = level ?: it.battery, charging = charging ?: it.charging, batteryAt = System.currentTimeMillis())
+        }
+        if (level != null && level != was.battery) AppStatus.log("RTB battery $level%")
+        if (charging != null && charging != was.charging) AppStatus.log(if (charging) "RTB charging" else "RTB not charging")
+        refreshNotification(force = true)
+    }
+
     // ------------------------------------------------------------------ Recorder.Output
 
     private val recorderOut = object : Recorder.Output {
@@ -323,7 +333,7 @@ class RtbService : Service(), RtbLink.Listener {
 
         override fun sessionEnd(s: SessionInfo, reason: String, discard: Boolean) {
             sinks.forEach { it.sessionEnd(s, reason, discard) }
-            if (discard) AppStatus.log("recording ${s.id.take(8)} deleted while recording; the receiver throws it away")
+            if (discard) AppStatus.log("recording ${s.id.take(8)} ${if (reason == "deleted") "deleted while recording" else "not kept ($reason)"}; the receiver throws it away")
             val live = recorder?.live.orEmpty()
             AppStatus.update {
                 if (s.parentId == null) it.copy(sessionStartedAt = null, commandOpen = false, live = live)
@@ -344,7 +354,8 @@ class RtbService : Service(), RtbLink.Listener {
             // otherwise the light going off already says it.
             val ms = settings.blinkMs.toLong()
             when {
-                start && ledShows -> main.postDelayed({ link?.blink(ms, 1) }, BLINK_AFTER_UNMUTE_MS)
+                // A press that read as a hold ends its "command" before this fires: no blink then.
+                start && ledShows -> main.postDelayed({ if (recorder?.commandOpen == true) link?.blink(ms, 1) }, BLINK_AFTER_UNMUTE_MS)
                 start -> link?.blink(ms, 1)
                 !ledShows -> link?.blink(ms, 2)
             }
@@ -385,6 +396,8 @@ class RtbService : Service(), RtbLink.Listener {
                 append("${mins} min · ")
             }
             append(st.sinks["network"]?.let { "receiver $it" } ?: st.linkDetail)
+            st.battery?.let { append(" · RTB $it%") }
+            if (st.charging == true) append(", charging")
         }
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,

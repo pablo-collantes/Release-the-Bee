@@ -101,6 +101,7 @@ class SettingsActivity : Activity() {
         secrets = SecretStore(this)
         setContentView(buildUi())
         loadDestination()
+        loadWords()
     }
 
     override fun onResume() {
@@ -577,6 +578,8 @@ class SettingsActivity : Activity() {
             topMargin = ui.dp(12)
         })
 
+        buildWordsSection(root)
+
         // Diagnostics
         root.addView(ui.sectionHeader("Diagnostics"))
         logView = ui.text(11f, ui.fgMuted).apply {
@@ -667,6 +670,86 @@ class SettingsActivity : Activity() {
                 "A command inside a summary also blinks twice when it ends; from a muted RTB, the light " +
                 "going off shows that. Set the blink length below.",
         ).apply { setPadding(ui.dp(32), 0, 0, 0) })
+    }
+
+    // ------------------------------------------------------------------ words
+
+    private lateinit var wordsView: TextView
+    private lateinit var wordsEdit: TextView
+    private var words: List<String>? = null          // null: not loaded from the receiver
+
+    /** Names and jargon whisper gets wrong: kept on the receiver, which primes whisper and the LLM with them. */
+    private fun buildWordsSection(root: LinearLayout) {
+        root.addView(ui.sectionHeader("Words to know"))
+        wordsView = ui.text(15f).apply {
+            setLineSpacing(ui.dpf(2f), 1f)
+            setOnClickListener { if (words == null) loadWords() }
+        }
+        wordsEdit = ui.link("Edit") { editWords() }
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(wordsView, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(wordsEdit, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = ui.dp(12) })
+        }, full())
+        root.addView(note(
+            "Names, products and jargon, spelled the way you write them (like Jev, not Jeff). Transcripts and " +
+                "summaries use them from the next recording on. Kept on your receiver.",
+        ))
+    }
+
+    private fun loadWords() {
+        val api = (Receiver.source(this) as? Receiver.Source.Ready)?.api
+        if (api == null) return renderWords("Set a WebSocket receiver to keep a word list.")
+        renderWords("Loading…")
+        Ui.io.execute {
+            val result = runCatching { api.words() }
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                result.onSuccess { words = it; renderWords() }
+                    .onFailure { renderWords("Couldn't reach your receiver. Tap to try again.") }
+            }
+        }
+    }
+
+    private fun renderWords(problem: String? = null) {
+        val w = words
+        wordsEdit.visibility = if (w != null) View.VISIBLE else View.GONE
+        wordsView.setTextColor(if (problem != null || w.isNullOrEmpty()) ui.fgMuted else ui.fg)
+        wordsView.text = problem ?: if (w.isNullOrEmpty()) "None yet" else w.joinToString(" · ")
+    }
+
+    private fun editWords() {
+        val api = (Receiver.source(this) as? Receiver.Source.Ready)?.api ?: return
+        val input = EditText(this).apply {
+            setText(words.orEmpty().joinToString("\n"))
+            hint = "One per line"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            minLines = 4
+            gravity = Gravity.TOP or Gravity.START
+            setSelection(text.length)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Words to know")
+            .setMessage("One per line, spelled the way you write it.")
+            .setView(FrameLayout(this).apply {
+                setPadding(ui.dp(20), ui.dp(4), ui.dp(20), 0)
+                addView(input)
+            })
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save") { _, _ ->
+                val list = input.text.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                renderWords("Saving…")
+                Ui.io.execute {
+                    val result = runCatching { api.putWords(list) }
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        result.onSuccess { words = it; renderWords() }
+                            .onFailure { renderWords(); toast("Couldn't reach your receiver: the words weren't saved") }
+                    }
+                }
+            }
+            .show()
     }
 
     /** Requests to try by hand, again and again, to see what the RTB's light can do. */

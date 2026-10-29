@@ -27,6 +27,7 @@ We call the device the **RTB** (as in *Release the Bee*).
 | Receiver: saves sessions, resumes after network drops, serves entries over HTTP | Works and is tested |
 | Local transcription, speakers, summaries and voice commands | **New.** Works on real recordings (whisper.cpp, sherpa-onnx, Gemma 4 E4B) |
 | Notes, reminders that ring, deleting recordings | **New in 0.4.** Unit-tested; hardware testing in progress |
+| RTB battery level, a word list for names whisper mishears | **New in 0.4.1.** Battery read from a real RTB |
 | Cloudflare relay, spill-to-disk buffering, extracting the token inside the app | Planned |
 
 ## Quick start
@@ -210,6 +211,10 @@ Android kills background work aggressively, so:
   Never sleeping apps*.
 - From a computer, this does the same as Unrestrict:
   `adb shell cmd deviceidle whitelist +io.github.pablocollantes.releasethebee`
+- **Don't make the app Android's debug app** (*Developer options → Select debug app*).
+  Android force-stops that app every time *Wireless debugging* turns on, which drops the
+  RTB (it mutes) until you open the app again. Clear it with
+  `adb shell am clear-debug-app`.
 
 ## Security
 

@@ -151,6 +151,18 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(self.get("/api/entries/e1/reprocess", method="POST").status, 404)
         self.assertEqual(self.get("/api/entries/ghost", method="DELETE").status, 404)
 
+    def test_words(self):
+        self.assertEqual(body(self.get("/api/words")), {"words": []})
+        r = self.get("/api/words", method="PUT", body=json.dumps({"words": [" Jev ", "RTB", "jev", "", "Release  the Bee"]}).encode())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body(r), {"words": ["Jev", "RTB", "Release the Bee"]})
+        self.assertEqual(body(self.get("/api/words")), {"words": ["Jev", "RTB", "Release the Bee"]})
+        self.assertEqual(rtb_entries.EntryStore(self.tmp.name).words(), ["Jev", "RTB", "Release the Bee"])
+        self.assertEqual(self.get("/api/words", method="PUT", body=b'{"words": "Jev"}').status, 400)
+        self.assertEqual(self.get("/api/words", method="PUT", body=b"nope").status, 400)
+        self.assertEqual(self.get("/api/words", method="DELETE").status, 405)
+        self.assertEqual(self.get("/api/words", token="t").status, 401)
+
     def test_audio_whole_and_ranges(self):
         r = self.get("/api/entries/e1/audio")
         self.assertEqual((r.status, r.ctype), (200, "audio/aac"))
